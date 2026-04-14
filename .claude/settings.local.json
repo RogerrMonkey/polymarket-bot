@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show:*)",
+      "Bash(python -c \"import anthropic, py_clob_client, flask, aiohttp; print\\('anthropic', anthropic.__version__\\); print\\('flask', flask.__version__\\); print\\('aiohttp', aiohttp.__version__\\)\")",
+      "Bash(python -m prediction_bot --help)",
+      "Bash(pip install:*)",
+      "Bash(python -m prediction_bot scorecard)",
+      "Bash(python -m prediction_bot usdc-check)",
+      "Bash(python -)",
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(python -m pytest tests/)"
+    ]
+  }
+}

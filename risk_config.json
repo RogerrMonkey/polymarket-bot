@@ -1,0 +1,10 @@
+{
+  "daily_loss_cap_pct": 0.05,
+  "max_drawdown_pct": 0.2,
+  "max_position_pct": 0.1,
+  "min_edge": 0.05,
+  "min_confidence": "Medium",
+  "kelly_fraction": 0.25,
+  "min_liquidity_usdc": 10000.0,
+  "kill_switch": false
+}

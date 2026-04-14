@@ -1,0 +1,53 @@
+# --- Secrets / local environment ----------------------------------
+# .env.example currently contains a live key (rotate + sanitize before
+# tracking it). Until then both .env and .env.example stay out of git.
+.env
+.env.example
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# --- Bot operational data + logs ----------------------------------
+# Paper-trading artifacts must never be committed.
+data/
+logs/
+*.jsonl
+*.log
+*.sqlite
+*.db
+predictions.db
+
+# --- Python -------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Tooling ------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Local scratch + per-developer state --------------------------
+# Personal Claude memory files and ad-hoc scratch scripts.
+memory/
+test.py
+
+# --- Editor / OS --------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini

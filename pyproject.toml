@@ -1,0 +1,28 @@
+[project]
+name = "prediction-bot"
+version = "0.1.0"
+description = "Risk-first prediction market bot foundation"
+requires-python = ">=3.11"
+dependencies = [
+  "requests>=2.32.0",
+  "websockets>=13.0",
+  "aiohttp>=3.10.0",
+  "web3>=7.0.0",
+  "anthropic>=0.57.0",
+  "flask>=3.0.0",
+  "python-dotenv>=1.0.0",
+  "py-clob-client>=0.25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
