@@ -24,12 +24,22 @@ def test_collect_pre_live_checks_aggregates(monkeypatch, tmp_path: Path) -> None
     )
     monkeypatch.setattr(checklist, "_check_risk_config", lambda root: [checklist.ChecklistItem("risk", True, "ok")])
     monkeypatch.setattr(checklist, "_check_paper_gates", lambda root, db_path: [checklist.ChecklistItem("gates", True, "ok")])
+    monkeypatch.setattr(
+        checklist,
+        "_check_paper_loop_has_run_today",
+        lambda root: checklist.ChecklistItem("loop_today", True, "ok"),
+    )
+    monkeypatch.setattr(
+        checklist,
+        "_check_news_feed_has_sources",
+        lambda root: checklist.ChecklistItem("news_sources", True, "ok"),
+    )
     monkeypatch.setattr(checklist, "_check_access", lambda: [checklist.ChecklistItem("access", True, "ok")])
 
     ready, items = checklist.run_pre_live_checklist(workspace_root=tmp_path, db_path=str(tmp_path / "db.sqlite"))
 
     assert ready is True
-    assert len(items) == 9
+    assert len(items) == 11
 
 
 def test_run_pre_live_checklist_fails_on_any_check(monkeypatch, tmp_path: Path) -> None:

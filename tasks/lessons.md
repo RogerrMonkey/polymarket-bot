@@ -13,3 +13,4 @@
 - Prompt sanitization checks need case-insensitive coverage because injection phrases often appear in mixed or upper case.
 - Graceful shutdown paths should handle both KeyboardInterrupt and SIGINT/SIGTERM with explicit cancel_all_open_orders to reduce stale exposure.
 - LLM cache-control assumptions should be validated in payload-level tests, not just by constructing helper metadata.
+- CryptoPanic free tier discontinued 2026-04-01 — use GDELT + RSS (feedparser) instead; no API key required. Polymarket + polygon.llamarpc.com are DNS-blocked from India and only reachable with Cloudflare WARP active locally.

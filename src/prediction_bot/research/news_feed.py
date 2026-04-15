@@ -2,17 +2,27 @@ from __future__ import annotations
 
 import hashlib
 import html
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from loguru import logger
 
 from prediction_bot.clients.http import HttpClient
 
-CRYPTOPANIC_URL = "https://cryptopanic.com/api/v1/posts/"
 GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+# Default free RSS feeds (business + crypto). Overridable via BOT_RSS_FEEDS
+# as a comma-separated list of URLs.
+DEFAULT_RSS_FEEDS: tuple[str, ...] = (
+    "https://feeds.reuters.com/reuters/businessNews",
+    "https://rss.cnn.com/rss/money_news_international.rss",
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+)
 
 HIGH_RELEVANCE_KEYWORDS = ["btc", "bitcoin", "price", "etf", "fed", "rate", "sec"]
 
@@ -132,63 +142,15 @@ def sanitize_for_prompt(text: str) -> str:
     return f"[EXTERNAL_DATA] {escaped}"
 
 
-class CryptoPanicFetcher:
-    def __init__(self, http: HttpClient, api_token: str) -> None:
-        self.http = http
-        self.api_token = api_token
-        self._seen_hashes: set[str] = set()
-
-    def fetch_once(self, limit: int = 20) -> list[NewsItem]:
-        try:
-            payload = self.http.get_json(
-                CRYPTOPANIC_URL,
-                params={
-                    "auth_token": self.api_token,
-                    "kind": "news",
-                    "currencies": "BTC,ETH",
-                    "public": "true",
-                },
-            )
-        except Exception:  # noqa: BLE001
-            return []
-
-        items = payload.get("results", []) if isinstance(payload, dict) else []
-        out: list[NewsItem] = []
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            url = str(item.get("url") or "").strip()
-            title = str(item.get("title") or "").strip()
-            if not url or not title:
-                continue
-
-            url_hash = hashlib.sha256(url.encode("utf-8", errors="ignore")).hexdigest()
-            if url_hash in self._seen_hashes:
-                continue
-            self._seen_hashes.add(url_hash)
-
-            published_at = _parse_datetime(str(item.get("published_at") or "")) or _utc_now()
-            source_obj = item.get("source") if isinstance(item.get("source"), dict) else {}
-            source_name = str(source_obj.get("title") or "cryptopanic")
-            body = str(item.get("slug") or "")
-            raw_text = f"{title} {body}".strip()
-            out.append(
-                NewsItem(
-                    title=title,
-                    source=source_name,
-                    url=url,
-                    published_at=published_at,
-                    raw_text=raw_text,
-                    relevance_score=_keyword_relevance(raw_text),
-                    sentiment=_classify_sentiment(raw_text),
-                    market_tags=_market_tags(raw_text),
-                )
-            )
-            if len(out) >= limit:
-                break
-
-        return out
+def _resolve_rss_feeds(override: list[str] | None = None) -> list[str]:
+    if override:
+        return list(override)
+    env_value = os.getenv("BOT_RSS_FEEDS", "").strip()
+    if env_value:
+        urls = [u.strip() for u in env_value.split(",") if u.strip()]
+        if urls:
+            return urls
+    return list(DEFAULT_RSS_FEEDS)
 
 
 class GDELTFetcher:
@@ -246,6 +208,100 @@ class GDELTFetcher:
         return out
 
 
+def _parse_rss_entry_datetime(entry: Any) -> datetime | None:
+    parsed = None
+    try:
+        parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    except (AttributeError, TypeError):
+        parsed = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+    if parsed is not None:
+        try:
+            return datetime(*parsed[:6], tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            pass
+    try:
+        raw = entry.get("published") or entry.get("updated")
+    except (AttributeError, TypeError):
+        raw = getattr(entry, "published", None) or getattr(entry, "updated", None)
+    return _parse_datetime(str(raw)) if raw else None
+
+
+class RSSFetcher:
+    """Parse free RSS feeds via the feedparser library.
+
+    Default feeds cover business + crypto and require no API key. Override the
+    list via the BOT_RSS_FEEDS env var (comma-separated URLs) or an explicit
+    feed_urls argument.
+    """
+
+    def __init__(self, http: HttpClient, feed_urls: list[str] | None = None) -> None:
+        self.http = http
+        self.feed_urls = _resolve_rss_feeds(feed_urls)
+        self._seen_hashes: set[str] = set()
+
+    def fetch_once(self, limit: int = 30) -> list[NewsItem]:
+        try:
+            import feedparser
+        except ImportError:
+            logger.warning("feedparser_not_installed — RSS news ingestion disabled")
+            return []
+
+        out: list[NewsItem] = []
+        for url in self.feed_urls:
+            if len(out) >= limit:
+                break
+            try:
+                parsed = feedparser.parse(url)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"rss_fetch_failed url={url} error={exc}")
+                continue
+
+            feed_obj = getattr(parsed, "feed", None)
+            try:
+                feed_title = feed_obj.get("title", "") if feed_obj is not None else ""
+            except (AttributeError, TypeError):
+                feed_title = getattr(feed_obj, "title", "") if feed_obj is not None else ""
+            source_name = f"rss:{(feed_title or url)[:40]}"
+
+            entries = getattr(parsed, "entries", None) or []
+            for entry in entries:
+                if len(out) >= limit:
+                    break
+                try:
+                    title = str(entry.get("title", "") or "").strip()
+                    link = str(entry.get("link", "") or "").strip()
+                    summary = str(entry.get("summary", "") or "")
+                except (AttributeError, TypeError):
+                    title = str(getattr(entry, "title", "") or "").strip()
+                    link = str(getattr(entry, "link", "") or "").strip()
+                    summary = str(getattr(entry, "summary", "") or "")
+
+                if not title or not link:
+                    continue
+
+                link_hash = hashlib.sha256(link.encode("utf-8", errors="ignore")).hexdigest()
+                if link_hash in self._seen_hashes:
+                    continue
+                self._seen_hashes.add(link_hash)
+
+                published_at = _parse_rss_entry_datetime(entry) or _utc_now()
+                raw_text = f"{title} {summary}".strip()
+                out.append(
+                    NewsItem(
+                        title=title,
+                        source=source_name,
+                        url=link,
+                        published_at=published_at,
+                        raw_text=raw_text,
+                        relevance_score=_keyword_relevance(raw_text),
+                        sentiment=_classify_sentiment(raw_text),
+                        market_tags=_market_tags(raw_text),
+                    )
+                )
+
+        return out
+
+
 def _dedupe_news(items: Iterable[NewsItem]) -> list[NewsItem]:
     seen = set()
     out: list[NewsItem] = []
@@ -258,37 +314,19 @@ def _dedupe_news(items: Iterable[NewsItem]) -> list[NewsItem]:
     return out
 
 
-def _cryptopanic_token_missing(token: str | None) -> bool:
-    if not token:
-        return True
-    cleaned = token.strip()
-    if not cleaned:
-        return True
-    # 'FREE' is the placeholder default in config — not a real working token.
-    return cleaned.upper() == "FREE"
-
-
 def get_relevant_news(
     http: HttpClient,
-    cryptopanic_api_token: str,
     gdelt_query: str = "bitcoin",
     min_relevance: float = 0.4,
     max_age_minutes: int = 30,
+    rss_feeds: list[str] | None = None,
 ) -> list[NewsItem]:
-    cp_items: list[NewsItem] = []
-    if _cryptopanic_token_missing(cryptopanic_api_token):
-        logger.warning(
-            "cryptopanic_token_missing — set BOT_CRYPTOPANIC_API_TOKEN to enable news ingestion. "
-            "Returning empty CryptoPanic signal; GDELT still attempted."
-        )
-    else:
-        cp_items = CryptoPanicFetcher(http=http, api_token=cryptopanic_api_token).fetch_once(limit=30)
-
     gdelt_items = GDELTFetcher(http=http, query=gdelt_query).fetch_once(limit=10)
+    rss_items = RSSFetcher(http=http, feed_urls=rss_feeds).fetch_once(limit=30)
 
     now = _utc_now()
     min_time = now - timedelta(minutes=max_age_minutes)
-    all_items = _dedupe_news([*cp_items, *gdelt_items])
+    all_items = _dedupe_news([*gdelt_items, *rss_items])
 
     filtered = [
         item

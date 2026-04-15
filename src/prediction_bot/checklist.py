@@ -25,6 +25,20 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _warp_hint_if_dns(detail: str) -> str:
+    """Append a WARP hint when the detail looks like a DNS/connection failure.
+
+    Polymarket + polygon.llamarpc are routinely DNS-blocked from India; Cloudflare
+    WARP lifts the block locally. Surface that hint on the check so the operator
+    knows the fix instead of chasing a generic network error.
+    """
+    lower = detail.lower()
+    triggers = ("getaddrinfo failed", "failed to resolve", "nameresolutionerror", "name or service not known")
+    if any(t in lower for t in triggers):
+        return "network_unreachable — enable Cloudflare WARP and retry; " + detail
+    return detail
+
+
 def _parse_bool(value: str | None) -> bool | None:
     if value is None:
         return None
@@ -59,7 +73,7 @@ def _check_polygon_rpc() -> ChecklistItem:
         status = response.status_code
         data = response.json() if response.content else {}
     except Exception as exc:  # noqa: BLE001
-        return ChecklistItem("env_polygon_rpc_responsive", False, f"rpc_error:{exc}")
+        return ChecklistItem("env_polygon_rpc_responsive", False, _warp_hint_if_dns(f"rpc_error:{exc}"))
 
     chain_id = data.get("result") if isinstance(data, dict) else None
     passed = 200 <= status < 300 and isinstance(chain_id, str) and chain_id.startswith("0x")
@@ -237,6 +251,88 @@ def _analysis_days(workspace_root: Path) -> int:
     return len(days)
 
 
+def _check_paper_loop_has_run_today(workspace_root: Path) -> ChecklistItem:
+    """Pass if analyses.jsonl has at least one entry timestamped today (UTC).
+
+    Acts as a live health signal that the daily scheduler is actually firing.
+    """
+    path = workspace_root / "data" / "analyses.jsonl"
+    if not path.exists():
+        return ChecklistItem("paper_loop_has_run_today", False, "analyses.jsonl missing")
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    last_ts_today: str | None = None
+
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(row, dict):
+            continue
+        ts = str(row.get("timestamp") or "").strip()
+        if not ts:
+            continue
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if dt.astimezone(timezone.utc).date().isoformat() == today:
+            last_ts_today = ts
+
+    if last_ts_today is not None:
+        return ChecklistItem("paper_loop_has_run_today", True, f"last_run_today={last_ts_today}")
+    return ChecklistItem(
+        "paper_loop_has_run_today",
+        False,
+        f"no_analyses_for_{today} — scheduler may be down",
+    )
+
+
+def _check_news_feed_has_sources(workspace_root: Path) -> ChecklistItem:
+    """Pass if the news pipeline returns at least one item from GDELT or RSS."""
+    from prediction_bot.clients.http import HttpClient
+    from prediction_bot.config import load_config
+    from prediction_bot.research.news_feed import GDELTFetcher, RSSFetcher
+
+    config = load_config()
+    http = HttpClient(
+        timeout_seconds=config.runtime.request_timeout_seconds,
+        user_agent=config.runtime.user_agent,
+    )
+
+    gdelt_count = 0
+    rss_count = 0
+    try:
+        gdelt_count = len(GDELTFetcher(http=http, query=config.research.gdelt_query).fetch_once(limit=5))
+    except Exception:  # noqa: BLE001
+        gdelt_count = 0
+    try:
+        rss_count = len(RSSFetcher(http=http).fetch_once(limit=5))
+    except Exception:  # noqa: BLE001
+        rss_count = 0
+
+    total = gdelt_count + rss_count
+    if total > 0:
+        return ChecklistItem(
+            "news_feed_has_sources",
+            True,
+            f"gdelt={gdelt_count} rss={rss_count}",
+        )
+    return ChecklistItem(
+        "news_feed_has_sources",
+        False,
+        "no news items from GDELT or RSS — check network/WARP and BOT_RSS_FEEDS",
+    )
+
+
 def _check_paper_gates(workspace_root: Path, db_path: str) -> list[ChecklistItem]:
     ready, failures = check_paper_gates(workspace_root=workspace_root, db_path=db_path)
     days = _analysis_days(workspace_root)
@@ -266,9 +362,9 @@ def _check_access() -> list[ChecklistItem]:
     ws = check_websocket()
 
     return [
-        ChecklistItem("access_clob_markets", clob.passed, clob.detail),
-        ChecklistItem("access_gamma_markets", gamma.passed, gamma.detail),
-        ChecklistItem("access_websocket", ws.passed, ws.detail),
+        ChecklistItem("access_clob_markets", clob.passed, _warp_hint_if_dns(clob.detail)),
+        ChecklistItem("access_gamma_markets", gamma.passed, _warp_hint_if_dns(gamma.detail)),
+        ChecklistItem("access_websocket", ws.passed, _warp_hint_if_dns(ws.detail)),
     ]
 
 
@@ -281,6 +377,8 @@ def collect_pre_live_checks(workspace_root: Path, db_path: str) -> list[Checklis
     checks.extend(_check_balance_and_open_orders())
     checks.extend(_check_risk_config(workspace_root))
     checks.extend(_check_paper_gates(workspace_root, db_path))
+    checks.append(_check_paper_loop_has_run_today(workspace_root))
+    checks.append(_check_news_feed_has_sources(workspace_root))
     checks.extend(_check_access())
     return checks
 

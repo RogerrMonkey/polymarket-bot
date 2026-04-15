@@ -32,7 +32,6 @@ class ResearchPipeline:
 
         news_items = get_relevant_news(
             http=self.sources.http,
-            cryptopanic_api_token=self.settings.cryptopanic_api_token,
             gdelt_query=self.settings.gdelt_query,
             min_relevance=self.settings.news_min_relevance,
             max_age_minutes=self.settings.news_max_age_minutes,

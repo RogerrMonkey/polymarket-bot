@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import os
 from pathlib import Path
 
 from prediction_bot.claude_analyst import ClaudeAnalyst
@@ -151,27 +150,21 @@ def execute_scan_run(
     claude_analyst: ClaudeAnalyst | None = None
     claude_news_items: list[NewsItem] = []
     if config.claude.enabled:
-        api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-        if not api_key:
-            ingestion.errors.append("claude_disabled_missing_api_key")
-        else:
-            claude_analyst = ClaudeAnalyst(
-                api_key=api_key,
-                model=config.claude.model,
-                web_search_max=config.claude.web_search_max,
-                daily_budget_usd=config.claude.daily_budget_usd,
-                log_path=root / "data" / "analyses.jsonl",
+        claude_analyst = ClaudeAnalyst(
+            model=config.claude.model,
+            web_search_max=config.claude.web_search_max,
+            daily_budget_usd=config.claude.daily_budget_usd,
+            log_path=root / "data" / "analyses.jsonl",
+        )
+        try:
+            claude_news_items = get_relevant_news(
+                http=http,
+                gdelt_query=config.research.gdelt_query,
+                min_relevance=config.research.news_min_relevance,
+                max_age_minutes=config.research.news_max_age_minutes,
             )
-            try:
-                claude_news_items = get_relevant_news(
-                    http=http,
-                    cryptopanic_api_token=config.research.cryptopanic_api_token,
-                    gdelt_query=config.research.gdelt_query,
-                    min_relevance=config.research.news_min_relevance,
-                    max_age_minutes=config.research.news_max_age_minutes,
-                )
-            except Exception as exc:  # noqa: BLE001
-                ingestion.errors.append(f"claude_news_error:{exc}")
+        except Exception as exc:  # noqa: BLE001
+            ingestion.errors.append(f"claude_news_error:{exc}")
 
     calibrator = ProbabilityCalibrator(config.calibration)
 

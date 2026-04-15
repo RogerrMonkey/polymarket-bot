@@ -173,8 +173,25 @@ def run_loop_command(
     allow_live_without_checklist: bool,
     schedule_kind: str | None = None,
     schedule_time: str = "08:00",
+    dry_run_schedule: bool = False,
 ) -> int:
     root = Path(".").resolve()
+
+    if dry_run_schedule:
+        from prediction_bot.claude_analyst import build_provider_chain
+
+        chain = build_provider_chain()
+        head = chain[0]
+        print(f"schedule_kind={schedule_kind or 'daily'}")
+        print(f"schedule_time={schedule_time} UTC")
+        print(f"analyst_provider={head.name}")
+        print(f"analyst_model={getattr(head, 'model', 'n/a')}")
+        print(
+            "warp_note=Polymarket + Polygon RPC require Cloudflare WARP active "
+            "for the daily run to reach real market data from India."
+        )
+        return 0
+
     if not dry_run:
         config = load_config()
         ready, checks = run_pre_live_checklist(workspace_root=root, db_path=config.storage.db_path)
@@ -280,11 +297,12 @@ def run_notify_alerts_command(force: bool) -> int:
 
 
 def run_news_check_command(limit: int) -> int:
-    """Smoke test the CryptoPanic + GDELT news pipeline; print the top N headlines."""
+    """Smoke test the GDELT + RSS news pipeline; print the top N headlines."""
     from prediction_bot.research.news_feed import (
-        CryptoPanicFetcher,
+        DEFAULT_RSS_FEEDS,
         GDELTFetcher,
-        _cryptopanic_token_missing,
+        RSSFetcher,
+        _resolve_rss_feeds,
     )
 
     config = load_config()
@@ -293,23 +311,18 @@ def run_news_check_command(limit: int) -> int:
         user_agent=config.runtime.user_agent,
     )
 
-    token = config.research.cryptopanic_api_token
-    if _cryptopanic_token_missing(token):
-        print("cryptopanic_token=missing")
-        print("hint=set BOT_CRYPTOPANIC_API_TOKEN in .env to enable CryptoPanic ingestion")
-    else:
-        print(f"cryptopanic_token=present (len={len(token.strip())})")
-
-    cp_items = []
-    if not _cryptopanic_token_missing(token):
-        cp_items = CryptoPanicFetcher(http=http, api_token=token).fetch_once(limit=limit)
-        print(f"cryptopanic_fetched={len(cp_items)}")
+    feeds = _resolve_rss_feeds()
+    feeds_source = "env:BOT_RSS_FEEDS" if feeds != list(DEFAULT_RSS_FEEDS) else "defaults"
+    print(f"rss_feed_count={len(feeds)} source={feeds_source}")
 
     gdelt_items = GDELTFetcher(http=http, query=config.research.gdelt_query).fetch_once(limit=limit)
     print(f"gdelt_fetched={len(gdelt_items)}")
 
+    rss_items = RSSFetcher(http=http, feed_urls=feeds).fetch_once(limit=limit * 2)
+    print(f"rss_fetched={len(rss_items)}")
+
+    combined = (gdelt_items + rss_items)[:limit]
     print(f"top_{limit}_headlines:")
-    combined = (cp_items + gdelt_items)[:limit]
     if not combined:
         print("  (no headlines)")
         return 1
@@ -430,6 +443,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="08:00",
         help="UTC HH:MM at which the scheduled run fires (default: 08:00)",
     )
+    loop.add_argument(
+        "--dry-run-schedule",
+        action="store_true",
+        help="Print scheduled time, analyst provider, model, and WARP reminder then exit",
+    )
 
     replay = sub.add_parser("replay-synthetic", help="Generate synthetic historical data for offline replay/backtesting")
     replay.add_argument("--days", type=int, default=14)
@@ -490,6 +508,7 @@ def main() -> int:
             allow_live_without_checklist=args.allow_live_without_checklist,
             schedule_kind=args.schedule,
             schedule_time=args.schedule_time,
+            dry_run_schedule=args.dry_run_schedule,
         )
     if args.command == "replay-synthetic":
         return run_synthetic_replay_command(

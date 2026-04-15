@@ -62,7 +62,7 @@ class _FakeMessages:
                         "decision": "YES",
                         "confidence": "High",
                         "reasoning": "fresh macro signal",
-                        "data_sources_used": ["cryptopanic", "gdelt"],
+                        "data_sources_used": ["rss", "gdelt"],
                     },
                 )
             ],

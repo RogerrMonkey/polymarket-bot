@@ -9,7 +9,7 @@
 - [x] Add Phase 0 verify_access.py deployment access checks (CLOB/Gamma/WS with timings).
 - [x] Add Phase 1 auth module with py-clob-client credential derivation and verify-auth CLI command.
 - [x] Add Phase 2 data_feed.py with websocket market subscription, reconnect loop, REST reconciliation, and Chainlink BTC price reader cache.
-- [x] Add Phase 3 deterministic news_feed.py (CryptoPanic + GDELT) with prompt-injection-safe sanitization and pipeline integration.
+- [x] Add Phase 3 deterministic news_feed.py (GDELT + RSS via feedparser) with prompt-injection-safe sanitization and pipeline integration.
 - [x] Add Phase 6 deterministic risk_engine.py with JSON config, portfolio_state persistence, ordered pre-trade checks, and rejection logging.
 - [x] Add Phase 4 watchlist manager with top-volume refresh and BTC 5-minute priority; apply watchlist filtering in scan runner.
 - [x] Add Phase 5 Claude analyst module with tool-schema parsing, prompt caching, cost tracking, and optional runner integration.
@@ -40,4 +40,8 @@
 - Completed: Outcome resolver job scaffolding added (`resolve-outcomes`) with dry-run/stub-first defaults and scheduler scripts.
 - Completed: Executor live order-placement scaffold added with poll/cancel lifecycle and safe stub mode toggles.
 - Completed: Data feed now emits Chainlink-enriched market state when oracle data is available.
+- Completed: Replaced CryptoPanic (free tier discontinued 2026-04-01) with GDELT + RSS (feedparser); no API key required.
+- Completed: First real paper-loop run against live Polymarket markets via Cloudflare WARP — analyses.jsonl now has entries with `provider=groq` and real market IDs.
+- Completed: Checklist hardened with `paper_loop_has_run_today`, `news_feed_has_sources`, and WARP-aware network-error hints.
+- Note: Polymarket + polygon.llamarpc.com are DNS-blocked from India — Cloudflare WARP must be active on the machine for the scanner and RPC checks to reach real endpoints.
 - Pending: Accumulate >=14 distinct paper-analysis days and stable daily signal flow to clear Phase 9 gates.
