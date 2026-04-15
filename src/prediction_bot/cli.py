@@ -279,6 +279,49 @@ def run_notify_alerts_command(force: bool) -> int:
     return 0 if result.sent else 1
 
 
+def run_news_check_command(limit: int) -> int:
+    """Smoke test the CryptoPanic + GDELT news pipeline; print the top N headlines."""
+    from prediction_bot.research.news_feed import (
+        CryptoPanicFetcher,
+        GDELTFetcher,
+        _cryptopanic_token_missing,
+    )
+
+    config = load_config()
+    http = HttpClient(
+        timeout_seconds=config.runtime.request_timeout_seconds,
+        user_agent=config.runtime.user_agent,
+    )
+
+    token = config.research.cryptopanic_api_token
+    if _cryptopanic_token_missing(token):
+        print("cryptopanic_token=missing")
+        print("hint=set BOT_CRYPTOPANIC_API_TOKEN in .env to enable CryptoPanic ingestion")
+    else:
+        print(f"cryptopanic_token=present (len={len(token.strip())})")
+
+    cp_items = []
+    if not _cryptopanic_token_missing(token):
+        cp_items = CryptoPanicFetcher(http=http, api_token=token).fetch_once(limit=limit)
+        print(f"cryptopanic_fetched={len(cp_items)}")
+
+    gdelt_items = GDELTFetcher(http=http, query=config.research.gdelt_query).fetch_once(limit=limit)
+    print(f"gdelt_fetched={len(gdelt_items)}")
+
+    print(f"top_{limit}_headlines:")
+    combined = (cp_items + gdelt_items)[:limit]
+    if not combined:
+        print("  (no headlines)")
+        return 1
+
+    for idx, item in enumerate(combined, start=1):
+        print(
+            f"  {idx}. [{item.source}] relevance={item.relevance_score:.2f} "
+            f"sentiment={item.sentiment} title={item.title[:120]}"
+        )
+    return 0
+
+
 def run_prelive_checklist_command(write_report: bool) -> int:
     root = Path(".").resolve()
     config = load_config()
@@ -419,6 +462,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("preflight", help="Run Gate Zero geo/access check")
     sub.add_parser("verify-auth", help="Run authenticated CLOB credential checks")
 
+    news = sub.add_parser("news-check", help="Smoke test the news pipeline; print top headlines")
+    news.add_argument("--limit", type=int, default=3)
+
     return parser
 
 
@@ -476,6 +522,8 @@ def main() -> int:
         return run_preflight_command()
     if args.command == "verify-auth":
         return run_verify_auth_command()
+    if args.command == "news-check":
+        return run_news_check_command(limit=args.limit)
 
     parser.error("Unknown command")
     return 2

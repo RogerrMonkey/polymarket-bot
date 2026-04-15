@@ -79,7 +79,7 @@ def test_get_relevant_news_filters_age_and_relevance(monkeypatch) -> None:
 
     items = get_relevant_news(
         http=_FakeHttp(),
-        cryptopanic_api_token="FREE",
+        cryptopanic_api_token="cp_test_token_abc123",
         gdelt_query="bitcoin",
         min_relevance=0.4,
         max_age_minutes=30,
@@ -88,3 +88,48 @@ def test_get_relevant_news_filters_age_and_relevance(monkeypatch) -> None:
     assert len(items) == 2
     assert items[0].relevance_score >= items[1].relevance_score
     assert all(i.published_at >= now - timedelta(minutes=30) for i in items)
+
+
+def test_get_relevant_news_degrades_when_cryptopanic_token_missing(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    cp_called = {"count": 0}
+
+    class _FakeCP:
+        def __init__(self, http, api_token):  # noqa: D401, ANN001, ANN202
+            cp_called["count"] += 1
+
+        def fetch_once(self, limit=30):  # noqa: ANN001, ANN202
+            return []
+
+    class _FakeGDELT:
+        def __init__(self, http, query):  # noqa: D401, ANN001, ANN202
+            pass
+
+        def fetch_once(self, limit=10):  # noqa: ANN001, ANN202
+            return [
+                NewsItem(
+                    title="BTC rate outlook",
+                    source="gdelt",
+                    url="https://c.example/news",
+                    published_at=now - timedelta(minutes=10),
+                    raw_text="btc fed rate outlook",
+                    relevance_score=0.6,
+                    sentiment="neutral",
+                    market_tags=["btc", "macro"],
+                )
+            ]
+
+    monkeypatch.setattr(news_feed, "CryptoPanicFetcher", _FakeCP)
+    monkeypatch.setattr(news_feed, "GDELTFetcher", _FakeGDELT)
+
+    items = get_relevant_news(
+        http=_FakeHttp(),
+        cryptopanic_api_token="FREE",
+        gdelt_query="bitcoin",
+        min_relevance=0.4,
+        max_age_minutes=30,
+    )
+
+    assert cp_called["count"] == 0
+    assert len(items) == 1
+    assert items[0].source == "gdelt"

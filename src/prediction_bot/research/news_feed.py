@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
+from loguru import logger
+
 from prediction_bot.clients.http import HttpClient
 
 CRYPTOPANIC_URL = "https://cryptopanic.com/api/v1/posts/"
@@ -256,6 +258,16 @@ def _dedupe_news(items: Iterable[NewsItem]) -> list[NewsItem]:
     return out
 
 
+def _cryptopanic_token_missing(token: str | None) -> bool:
+    if not token:
+        return True
+    cleaned = token.strip()
+    if not cleaned:
+        return True
+    # 'FREE' is the placeholder default in config — not a real working token.
+    return cleaned.upper() == "FREE"
+
+
 def get_relevant_news(
     http: HttpClient,
     cryptopanic_api_token: str,
@@ -263,12 +275,20 @@ def get_relevant_news(
     min_relevance: float = 0.4,
     max_age_minutes: int = 30,
 ) -> list[NewsItem]:
-    cp = CryptoPanicFetcher(http=http, api_token=cryptopanic_api_token)
-    gdelt = GDELTFetcher(http=http, query=gdelt_query)
+    cp_items: list[NewsItem] = []
+    if _cryptopanic_token_missing(cryptopanic_api_token):
+        logger.warning(
+            "cryptopanic_token_missing — set BOT_CRYPTOPANIC_API_TOKEN to enable news ingestion. "
+            "Returning empty CryptoPanic signal; GDELT still attempted."
+        )
+    else:
+        cp_items = CryptoPanicFetcher(http=http, api_token=cryptopanic_api_token).fetch_once(limit=30)
+
+    gdelt_items = GDELTFetcher(http=http, query=gdelt_query).fetch_once(limit=10)
 
     now = _utc_now()
     min_time = now - timedelta(minutes=max_age_minutes)
-    all_items = _dedupe_news([*cp.fetch_once(limit=30), *gdelt.fetch_once(limit=10)])
+    all_items = _dedupe_news([*cp_items, *gdelt_items])
 
     filtered = [
         item
