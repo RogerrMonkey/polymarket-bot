@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 from prediction_bot.dashboard import (
     _build_prelive_summary,
@@ -11,6 +14,7 @@ from prediction_bot.dashboard import (
     _build_trend_chart_rows,
     _load_risk_config,
     _save_kill_switch,
+    create_dashboard_app,
 )
 
 
@@ -106,3 +110,50 @@ def test_build_resolver_summary() -> None:
     assert out["status"] == "ready"
     assert out["checked"] == 15
     assert out["resolved"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Flask endpoint smoke tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def dashboard_client(tmp_path: Path):
+    """Create a minimal workspace and return a Flask test client."""
+    # Minimal risk_config.json so the app can load
+    risk_cfg = {
+        "daily_loss_cap_pct": 0.05,
+        "max_drawdown_pct": 0.10,
+        "max_position_pct": 0.10,
+        "min_edge": 0.03,
+        "min_confidence": 0.60,
+        "kelly_fraction": 0.25,
+        "min_liquidity_usdc": 100.0,
+        "kill_switch": False,
+    }
+    (tmp_path / "risk_config.json").write_text(json.dumps(risk_cfg))
+    (tmp_path / "data").mkdir()
+
+    app = create_dashboard_app(workspace_root=tmp_path)
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        yield client
+
+
+def test_home_returns_200(dashboard_client) -> None:
+    resp = dashboard_client.get("/")
+    assert resp.status_code == 200
+    body = resp.data.decode("utf-8")
+    assert "Control Room" in body
+
+
+def test_api_status_returns_valid_json(dashboard_client) -> None:
+    resp = dashboard_client.get("/api/status")
+    assert resp.status_code == 200
+    assert resp.content_type.startswith("application/json")
+    data = json.loads(resp.data)
+    assert "provider" in data
+    assert "warp_status" in data
+    assert "paper_days_done" in data
+    assert "checklist_pass_count" in data
+    assert isinstance(data["uptime_seconds"], (int, float))

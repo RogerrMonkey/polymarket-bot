@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
+import time
+from collections import Counter
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, flash, get_flashed_messages, jsonify, redirect, render_template_string, request, url_for
 
 from prediction_bot.alerting import dispatch_alerts, read_alert_state
-from prediction_bot.checklist import read_pre_live_report, run_pre_live_checklist, write_pre_live_report
+from prediction_bot.checklist import (
+    collect_pre_live_checks,
+    read_pre_live_report,
+    run_pre_live_checklist,
+    write_pre_live_report,
+)
 from prediction_bot.clients.http import HttpClient
 from prediction_bot.clients.polymarket import PolymarketClient
 from prediction_bot.config import load_config
@@ -24,56 +33,60 @@ from prediction_bot.telemetry import build_alerts, build_telemetry_snapshot, bui
 from prediction_bot.usdc_ops import USDCCheckReport, run_usdc_operational_checks
 
 
+PAPER_DAYS_TARGET = 14
+_PROCESS_START_TS = time.time()
+
+
 def _parse_iso(value: str | None) -> datetime | None:
-  if not value:
-    return None
-  text = value.strip()
-  if text.endswith("Z"):
-    text = text[:-1] + "+00:00"
-  try:
-    dt = datetime.fromisoformat(text)
-  except ValueError:
-    return None
-  if dt.tzinfo is None:
-    dt = dt.replace(tzinfo=timezone.utc)
-  return dt.astimezone(timezone.utc)
+    if not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _build_trade_lifecycle(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
-  buckets: dict[str, list[dict[str, Any]]] = {}
-  for row in trades:
-    order_id = str(row.get("order_id") or "unknown-order")
-    buckets.setdefault(order_id, []).append(row)
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for row in trades:
+        order_id = str(row.get("order_id") or "unknown-order")
+        buckets.setdefault(order_id, []).append(row)
 
-  summaries: list[dict[str, Any]] = []
-  for order_id, rows in buckets.items():
-    rows.sort(key=lambda r: str(r.get("timestamp") or ""))
-    first = rows[0]
-    last = rows[-1]
-    status_path = " -> ".join(str(r.get("status") or "unknown") for r in rows)
+    summaries: list[dict[str, Any]] = []
+    for order_id, rows in buckets.items():
+        rows.sort(key=lambda r: str(r.get("timestamp") or ""))
+        first = rows[0]
+        last = rows[-1]
+        status_path = " -> ".join(str(r.get("status") or "unknown") for r in rows)
 
-    first_ts = _parse_iso(str(first.get("timestamp") or ""))
-    last_ts = _parse_iso(str(last.get("timestamp") or ""))
-    duration_seconds = None
-    if first_ts is not None and last_ts is not None:
-      duration_seconds = max(0.0, (last_ts - first_ts).total_seconds())
+        first_ts = _parse_iso(str(first.get("timestamp") or ""))
+        last_ts = _parse_iso(str(last.get("timestamp") or ""))
+        duration_seconds = None
+        if first_ts is not None and last_ts is not None:
+            duration_seconds = max(0.0, (last_ts - first_ts).total_seconds())
 
-    summaries.append(
-      {
-        "order_id": order_id,
-        "market_id": str(last.get("market_id") or ""),
-        "side": str(last.get("side") or ""),
-        "size_usdc": last.get("size_usdc"),
-        "latest_status": str(last.get("status") or ""),
-        "status_path": status_path,
-        "events": len(rows),
-        "duration_seconds": duration_seconds,
-        "last_timestamp": str(last.get("timestamp") or ""),
-      }
-    )
+        summaries.append(
+            {
+                "order_id": order_id,
+                "market_id": str(last.get("market_id") or ""),
+                "side": str(last.get("side") or ""),
+                "size_usdc": last.get("size_usdc"),
+                "latest_status": str(last.get("status") or ""),
+                "status_path": status_path,
+                "events": len(rows),
+                "duration_seconds": duration_seconds,
+                "last_timestamp": str(last.get("timestamp") or ""),
+            }
+        )
 
-  summaries.sort(key=lambda s: s.get("last_timestamp", ""), reverse=True)
-  return summaries
+    summaries.sort(key=lambda s: s.get("last_timestamp", ""), reverse=True)
+    return summaries
 
 
 def _read_jsonl(path: Path, limit: int = 20) -> list[dict[str, Any]]:
@@ -91,6 +104,23 @@ def _read_jsonl(path: Path, limit: int = 20) -> list[dict[str, Any]]:
         if isinstance(row, dict):
             rows.append(row)
     return rows[-limit:][::-1]
+
+
+def _read_jsonl_all(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
 
 
 def _load_risk_config(path: Path) -> RiskConfig:
@@ -221,187 +251,502 @@ def _build_resolver_summary(report: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------- #
+# v0.8.2 dashboard builders
+# --------------------------------------------------------------------------- #
+
+
+def _warp_status(host: str = "gamma-api.polymarket.com") -> dict[str, Any]:
+    """Quick DNS probe to the Polymarket Gamma host; WARP routes it when DNS is blocked."""
+    try:
+        socket.gethostbyname(host)
+        return {"ok": True, "label": "WARP ON", "host": host}
+    except OSError as exc:
+        return {"ok": False, "label": "WARP OFF", "host": host, "error": str(exc)}
+
+
+def _resolve_provider_and_model() -> dict[str, str]:
+    provider = (os.getenv("ANALYST_PROVIDER", "") or "").strip().lower()
+    if provider == "groq" or (not provider and (os.getenv("GROQ_API_KEY", "") or "").strip()):
+        return {"provider": "groq", "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")}
+    if provider == "anthropic" or (os.getenv("ANTHROPIC_API_KEY", "") or "").strip():
+        return {"provider": "anthropic", "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")}
+    if provider == "ollama" or (os.getenv("OLLAMA_BASE_URL", "") or "").strip():
+        return {"provider": "ollama", "model": os.getenv("OLLAMA_MODEL", "qwen2.5:3b")}
+    return {"provider": "stub", "model": "deterministic"}
+
+
+def _format_uptime(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {mins}m"
+    if hours:
+        return f"{hours}h {mins}m"
+    if mins:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def _paper_days_progress(analyses: list[dict[str, Any]]) -> dict[str, Any]:
+    """Distinct UTC dates from analyses.jsonl → progress toward PAPER_DAYS_TARGET."""
+    distinct: set[str] = set()
+    for row in analyses:
+        ts = _parse_iso(str(row.get("timestamp") or ""))
+        if ts is None:
+            continue
+        distinct.add(ts.date().isoformat())
+
+    days_done = len(distinct)
+    pct = _clamp_pct((days_done / PAPER_DAYS_TARGET) * 100.0 if PAPER_DAYS_TARGET else 0.0)
+    days_remaining = max(0, PAPER_DAYS_TARGET - days_done)
+    est_completion = (datetime.now(timezone.utc).date() + timedelta(days=days_remaining)).isoformat()
+    return {
+        "days_done": days_done,
+        "target": PAPER_DAYS_TARGET,
+        "pct": pct,
+        "days_remaining": days_remaining,
+        "estimated_completion": est_completion,
+        "distinct_dates": sorted(distinct),
+    }
+
+
+def _todays_analyses(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    today = datetime.now(timezone.utc).date()
+    out: list[dict[str, Any]] = []
+    for row in analyses:
+        ts = _parse_iso(str(row.get("timestamp") or ""))
+        if ts is None or ts.date() != today:
+            continue
+        decision = str(row.get("decision") or "").upper()
+        decision_class = "grey"
+        if decision in {"YES", "BUY"}:
+            decision_class = "green"
+        elif decision in {"NO", "SELL"}:
+            decision_class = "red"
+        out.append(
+            {
+                "timestamp": row.get("timestamp"),
+                "market_id": str(row.get("market_id") or ""),
+                "decision": decision or "SKIP",
+                "decision_class": decision_class,
+                "confidence": str(row.get("confidence") or ""),
+                "probability": row.get("probability"),
+                "edge": row.get("edge"),
+                "provider": str(row.get("provider") or ""),
+            }
+        )
+    out.sort(key=lambda r: str(r.get("timestamp") or ""), reverse=True)
+    return out
+
+
+def _classify_rejection_reason(reason: str) -> str:
+    lower = (reason or "").lower()
+    if "kill" in lower:
+        return "danger"
+    if "confidence" in lower:
+        return "warning"
+    if "edge" in lower or "insufficient" in lower:
+        return "info"
+    return "neutral"
+
+
+def _build_rejection_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        reason = str(row.get("reason") or "")
+        out.append(
+            {
+                "timestamp": str(row.get("timestamp") or ""),
+                "market_id": str(row.get("market_id") or ""),
+                "reason": reason,
+                "class": _classify_rejection_reason(reason),
+            }
+        )
+    return out
+
+
+def _top_rejection_reasons(risk_rows_all: list[dict[str, Any]], limit: int = 3) -> list[dict[str, Any]]:
+    counter: Counter[str] = Counter()
+    for row in risk_rows_all:
+        reason = str(row.get("reason") or "").strip()
+        if reason:
+            counter[reason] += 1
+    return [{"reason": r, "count": c} for r, c in counter.most_common(limit)]
+
+
+def _decision_breakdown(analyses: list[dict[str, Any]]) -> dict[str, Any]:
+    counter: Counter[str] = Counter()
+    for row in analyses:
+        decision = str(row.get("decision") or "").upper() or "SKIP"
+        if decision in {"BUY", "YES"}:
+            counter["BUY"] += 1
+        elif decision in {"SELL", "NO"}:
+            counter["SELL"] += 1
+        else:
+            counter["SKIP"] += 1
+    total = sum(counter.values())
+    rows = []
+    for label in ("SKIP", "BUY", "SELL"):
+        count = counter.get(label, 0)
+        rows.append(
+            {
+                "label": label,
+                "count": count,
+                "pct": _clamp_pct((count / total * 100.0) if total else 0.0),
+            }
+        )
+    return {"total": total, "rows": rows}
+
+
+_CHECK_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "Network",
+        (
+            "env_polygon_rpc_responsive",
+            "access_clob_markets",
+            "access_gamma_markets",
+            "access_websocket",
+        ),
+    ),
+    (
+        "Analyst",
+        (
+            "analyst_provider_resolved",
+            "news_feed_has_sources",
+        ),
+    ),
+    (
+        "Paper Progress",
+        (
+            "paper_gates_passed",
+            "paper_minimum_14_days",
+            "paper_loop_has_run_today",
+        ),
+    ),
+    (
+        "Wallet / USDC",
+        (
+            "env_polymarket_private_key_present",
+            "env_polymarket_funder_address_present",
+            "env_signature_type_present",
+            "balance_usdc_gt_20",
+            "open_orders_empty",
+        ),
+    ),
+    (
+        "Safety",
+        (
+            "env_dry_run_false",
+            "risk_kill_switch_false",
+            "risk_daily_loss_cap_range",
+            "risk_max_position_pct",
+            "risk_kelly_fraction",
+        ),
+    ),
+)
+
+
+def _group_checks_into_sections(checks: list[Any]) -> list[dict[str, Any]]:
+    by_name: dict[str, Any] = {getattr(c, "name", ""): c for c in checks}
+    claimed: set[str] = set()
+    grouped: list[dict[str, Any]] = []
+
+    for section_name, names in _CHECK_SECTIONS:
+        checks_list: list[dict[str, Any]] = []
+        for n in names:
+            c = by_name.get(n)
+            if c is None:
+                continue
+            claimed.add(n)
+            checks_list.append({"name": c.name, "passed": bool(c.passed), "detail": c.detail})
+        if checks_list:
+            grouped.append({"section": section_name, "checks": checks_list})
+
+    leftover = [
+        {"name": getattr(c, "name", ""), "passed": bool(getattr(c, "passed", False)), "detail": getattr(c, "detail", "")}
+        for c in checks
+        if getattr(c, "name", "") and getattr(c, "name", "") not in claimed
+    ]
+    if leftover:
+        grouped.append({"section": "Other", "checks": leftover})
+    return grouped
+
+
+# --------------------------------------------------------------------------- #
+# HTML
+# --------------------------------------------------------------------------- #
+
+
 DASHBOARD_HTML = """
 <!doctype html>
-<html lang="en">
+<html lang=\"en\">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Polymarket Bot Control Room</title>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>Polymarket Bot — Control Room</title>
   <style>
     :root {
-      --bg: #f3efe6;
-      --panel: #fffdf8;
-      --ink: #1d2a35;
-      --muted: #617282;
-      --accent: #1f7a8c;
-      --danger: #b03a2e;
-      --good: #2e8b57;
-      --line: #dccfb8;
+      --bg: #0f1117;
+      --panel: #1a1d27;
+      --panel-2: #222634;
+      --ink: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #6366f1;
+      --accent-dim: #4338ca;
+      --good: #22c55e;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+      --info: #38bdf8;
+      --line: #2a2f3d;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
-    body { margin: 0; background: radial-gradient(circle at top right, #efe2cc 0%, var(--bg) 60%); color: var(--ink); font-family: "Trebuchet MS", "Segoe UI", sans-serif; }
-    .wrap { max-width: 1200px; margin: 0 auto; padding: 20px; }
-    h1 { margin: 0 0 12px; letter-spacing: 0.5px; }
-    .sub { color: var(--muted); margin-bottom: 16px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
-    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; box-shadow: 0 6px 18px rgba(0,0,0,0.05); }
-    .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.7px; }
-    .v { font-size: 24px; margin-top: 4px; }
-    .row { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0; }
-    button { border: 0; border-radius: 999px; padding: 10px 14px; cursor: pointer; font-weight: 600; }
-    .a { background: var(--accent); color: white; }
-    .d { background: var(--danger); color: white; }
-    .g { background: var(--good); color: white; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--line); font-size: 13px; }
-    .flash { background: #fff3d8; border: 1px solid #e6c985; border-radius: 10px; padding: 10px; margin-bottom: 10px; }
-    code { background: #f4eee0; padding: 2px 6px; border-radius: 6px; }
-    .chart-row { display: grid; grid-template-columns: 120px 1fr 56px; gap: 8px; align-items: center; margin-bottom: 8px; }
-    .chart-label { color: var(--muted); font-size: 12px; }
-    .chart-track { background: #efe4cf; border-radius: 999px; height: 12px; overflow: hidden; }
-    .chart-fill { height: 12px; border-radius: 999px; }
-    .chart-fill.throughput { background: linear-gradient(90deg, #2f9e44, #6cc24a); }
-    .chart-fill.accuracy { background: linear-gradient(90deg, #1f7a8c, #4db8c8); }
-    .chart-fill.brierq { background: linear-gradient(90deg, #b8860b, #f3c35a); }
-    .chart-val { text-align: right; font-size: 12px; color: var(--ink); }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: system-ui, -apple-system, \"Segoe UI\", Roboto, sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+    .wrap { max-width: 1280px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: 0.2px; }
+    h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; font-weight: 600; }
+    h3 { font-size: 13px; margin: 0 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .mono, code { font-family: var(--mono); font-size: 13px; }
+    .status-bar {
+      display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+      padding: 10px 14px; margin-bottom: 16px;
+    }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+      background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
+    }
+    .pill.good { background: rgba(34, 197, 94, 0.12); color: var(--good); border-color: rgba(34, 197, 94, 0.35); }
+    .pill.warn { background: rgba(245, 158, 11, 0.12); color: var(--warn); border-color: rgba(245, 158, 11, 0.35); }
+    .pill.bad  { background: rgba(239, 68, 68, 0.12); color: var(--bad);  border-color: rgba(239, 68, 68, 0.35); }
+    .pill.info { background: rgba(99, 102, 241, 0.14); color: #a5b4fc; border-color: rgba(99, 102, 241, 0.35); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: currentColor; }
+    .spacer { flex: 1; }
+    .grid { display: grid; gap: 14px; }
+    .grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+    .grid.cols-3 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+    .panel {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+      padding: 14px; min-width: 0;
+    }
+    .panel .head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; }
+    .panel .head h2 { margin: 0; }
+    .panel .head .sub { color: var(--muted); font-size: 12px; }
+    .bar-track { background: var(--panel-2); border-radius: 999px; height: 10px; overflow: hidden; margin: 8px 0; }
+    .bar-fill { height: 10px; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); border-radius: 999px; }
+    .kv { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; padding: 2px 0; }
+    .kv .k { color: var(--muted); }
+    .kv .v { font-family: var(--mono); }
+    .cards { display: flex; flex-direction: column; gap: 8px; max-height: 360px; overflow: auto; }
+    .card-row {
+      background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+      padding: 8px 10px; display: grid; grid-template-columns: 1fr auto; gap: 4px; align-items: center;
+    }
+    .card-row .left .market { font-family: var(--mono); font-size: 13px; color: var(--ink); }
+    .card-row .left .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700;
+      font-family: var(--mono); letter-spacing: 0.4px;
+    }
+    .badge.grey  { background: #2d3443; color: #cbd5e1; }
+    .badge.green { background: rgba(34, 197, 94, 0.18); color: var(--good); }
+    .badge.red   { background: rgba(239, 68, 68, 0.18); color: var(--bad); }
+    .check-item {
+      display: grid; grid-template-columns: 16px 1fr auto; gap: 8px; align-items: start;
+      padding: 4px 0; font-size: 13px; border-bottom: 1px solid transparent;
+    }
+    .check-item .sym { font-weight: 700; }
+    .check-item.pass .sym { color: var(--good); }
+    .check-item.fail .sym { color: var(--bad); }
+    .check-item .detail { color: var(--muted); font-family: var(--mono); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .section-title {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted);
+      margin: 10px 0 4px; padding-top: 6px; border-top: 1px solid var(--line);
+    }
+    .section-title:first-of-type { border-top: 0; padding-top: 0; margin-top: 0; }
+    .risk-row {
+      display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center;
+      padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 12.5px;
+    }
+    .risk-row:last-child { border-bottom: 0; }
+    .risk-row .ts { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+    .risk-row .mkt { font-family: var(--mono); font-size: 12px; color: #c7d2fe; }
+    .metric-bar { display: grid; grid-template-columns: 60px 1fr 60px; gap: 8px; align-items: center; margin: 6px 0; font-size: 12px; }
+    .metric-bar .label { color: var(--muted); font-family: var(--mono); }
+    .metric-bar .track { background: var(--panel-2); height: 14px; border-radius: 4px; overflow: hidden; }
+    .metric-bar .fill.skip  { background: #475569; height: 14px; }
+    .metric-bar .fill.buy   { background: var(--good); height: 14px; }
+    .metric-bar .fill.sell  { background: var(--bad);  height: 14px; }
+    .metric-bar .val { text-align: right; font-family: var(--mono); color: var(--ink); }
+    .rej-table { width: 100%; font-size: 12.5px; }
+    .rej-table td { padding: 4px 6px; border-bottom: 1px solid var(--line); }
+    .rej-table td.count { text-align: right; font-family: var(--mono); color: var(--warn); }
+    .rej-table tr:last-child td { border-bottom: 0; }
+    .flash { background: rgba(99, 102, 241, 0.12); border: 1px solid var(--accent); color: var(--ink); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; font-size: 13px; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+    .toolbar form { margin: 0; }
+    .btn {
+      border: 1px solid var(--line); background: var(--panel-2); color: var(--ink);
+      padding: 6px 12px; border-radius: 8px; font-size: 12px; cursor: pointer; font-weight: 600;
+    }
+    .btn:hover { background: #2d3243; border-color: var(--accent); }
+    .btn.danger { background: rgba(239, 68, 68, 0.18); color: var(--bad); border-color: rgba(239, 68, 68, 0.35); }
+    .btn.good   { background: rgba(34, 197, 94, 0.14); color: var(--good); border-color: rgba(34, 197, 94, 0.35); }
+    .empty { color: var(--muted); font-size: 12.5px; font-style: italic; padding: 8px 0; }
+    .footer-links { margin-top: 16px; font-size: 12px; color: var(--muted); }
+    .footer-links a { margin-right: 12px; }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>Polymarket Bot Control Room</h1>
-    <div class="sub">Manage scans, risk switches, and paper-readiness checks from one place.</div>
-    <div class="sub"><a href="{{ url_for('trades_view') }}">Trade Lifecycle Drilldown</a> | <a href="{{ url_for('api_state') }}">API State</a> | <a href="{{ url_for('api_trades_lifecycle') }}">API Trades Lifecycle</a> | <a href="{{ url_for('api_trends') }}">API Trends</a> | <a href="{{ url_for('api_prelive_report') }}">API Prelive Report</a> | <a href="{{ url_for('api_replay_report') }}">API Replay Report</a> | <a href="{{ url_for('api_resolver_report') }}">API Resolver Report</a></div>
+  <div class=\"wrap\">
+    <!-- Panel 1: Status Bar -->
+    <div class=\"status-bar\">
+      <span class=\"pill info\"><span class=\"dot\"></span>{{ status.provider }} · {{ status.model }}</span>
+      {% if status.warp.ok %}
+        <span class=\"pill good\"><span class=\"dot\"></span>{{ status.warp.label }}</span>
+      {% else %}
+        <span class=\"pill bad\"><span class=\"dot\"></span>{{ status.warp.label }}</span>
+      {% endif %}
+      {% if status.paper_mode %}
+        <span class=\"pill warn\"><span class=\"dot\"></span>PAPER MODE</span>
+      {% else %}
+        <span class=\"pill bad\"><span class=\"dot\"></span>LIVE MODE</span>
+      {% endif %}
+      <span class=\"pill\">uptime {{ status.uptime }}</span>
+      <span class=\"spacer\"></span>
+      <span class=\"pill\">checklist {{ status.checklist_pass_count }}/{{ status.checklist_total }}</span>
+    </div>
+
+    <h1>Polymarket Bot — Control Room</h1>
+    <div class=\"mono\" style=\"color: var(--muted); margin-bottom: 14px;\">{{ status.now_utc }}</div>
 
     {% for msg in flashes %}
-      <div class="flash">{{ msg }}</div>
+      <div class=\"flash\">{{ msg }}</div>
     {% endfor %}
 
-    <div class="grid">
-      <div class="panel"><div class="k">Preflight</div><div class="v">{{ preflight.message }}</div><div>blocked={{ preflight.blocked }} country={{ preflight.country }}</div></div>
-      <div class="panel"><div class="k">Signals Today</div><div class="v">{{ summary.total_signals }}</div><div>traded={{ summary.signals_traded }} rejected={{ summary.signals_rejected }}</div></div>
-      <div class="panel"><div class="k">Brier Score</div><div class="v">{{ summary.brier_score }}</div><div>risk_cap_hits={{ summary.risk_cap_hits }}</div></div>
-      <div class="panel"><div class="k">Paper Gates</div><div class="v">{{ ready_for_live }}</div><div>{{ gate_failures|join(', ') if gate_failures else 'all clear' }}</div></div>
-      <div class="panel"><div class="k">Kill Switch</div><div class="v">{{ risk.kill_switch }}</div><div>min_edge={{ risk.min_edge }} max_position={{ risk.max_position_pct }}</div></div>
-      <div class="panel"><div class="k">USDC Ops</div><div class="v">{{ usdc.ready }}</div><div>{{ usdc_failed|join(', ') if usdc_failed else 'all critical checks pass' }}</div></div>
-      <div class="panel"><div class="k">Telemetry Alerts</div><div class="v">{{ alerts|length }}</div><div>{{ alerts|join(', ') if alerts else 'none' }}</div></div>
-      <div class="panel"><div class="k">Last Alert Dispatch</div><div class="v">{{ alert_state.last_result if alert_state else 'none' }}</div><div>status={{ alert_state.last_status if alert_state else 'n/a' }}</div></div>
-      <div class="panel"><div class="k">7d Trend</div><div class="v">{{ trends['7d'].signals_traded }}/{{ trends['7d'].total_signals }}</div><div>approval={{ trends['7d'].approval_rate }} brier={{ trends['7d'].brier_score }}</div></div>
-      <div class="panel"><div class="k">30d Trend</div><div class="v">{{ trends['30d'].signals_traded }}/{{ trends['30d'].total_signals }}</div><div>approval={{ trends['30d'].approval_rate }} brier={{ trends['30d'].brier_score }}</div></div>
-      <div class="panel"><div class="k">Prelive Checklist</div><div class="v">{{ prelive_summary.status }}</div><div>pass={{ prelive_summary.passed_count }} fail={{ prelive_summary.failed_count }}</div></div>
-      <div class="panel"><div class="k">Synthetic Replay</div><div class="v">{{ replay_summary.status }}</div><div>scenario={{ replay_summary.scenario }} loops={{ replay_summary.loops_written }}</div></div>
-      <div class="panel"><div class="k">Outcome Resolver</div><div class="v">{{ resolver_summary.status }}</div><div>checked={{ resolver_summary.checked }} resolved={{ resolver_summary.resolved }} applied={{ resolver_summary.applied }}</div></div>
-    </div>
+    <div class=\"grid cols-2\">
+      <!-- Panel 2: Paper Progress -->
+      <div class=\"panel\">
+        <div class=\"head\"><h2>Paper Progress</h2><span class=\"sub\">phase gate tracker</span></div>
+        <div class=\"kv\"><span class=\"k\">Distinct paper days</span><span class=\"v\">{{ paper_days.days_done }} / {{ paper_days.target }}</span></div>
+        <div class=\"bar-track\"><div class=\"bar-fill\" style=\"width: {{ paper_days.pct }}%\"></div></div>
+        <div class=\"kv\"><span class=\"k\">Days remaining</span><span class=\"v\">{{ paper_days.days_remaining }}</span></div>
+        <div class=\"kv\"><span class=\"k\">Estimated completion</span><span class=\"v\">{{ paper_days.estimated_completion }}</span></div>
+      </div>
 
-    <div class="grid">
-      <div class="panel">
-        <h3>Trend Chart: Throughput</h3>
-        {% for row in trend_charts.throughput %}
-          <div class="chart-row">
-            <div class="chart-label">{{ row.window }} traded</div>
-            <div class="chart-track"><div class="chart-fill throughput" style="width: {{ row.pct }}%"></div></div>
-            <div class="chart-val">{{ row.traded }}/{{ row.total }}</div>
+      <!-- Panel 6: Performance Metrics -->
+      <div class=\"panel\">
+        <div class=\"head\"><h2>Performance</h2><span class=\"sub\">analysis + risk stats</span></div>
+        <div class=\"kv\"><span class=\"k\">Brier score</span><span class=\"v\">{{ perf.brier_score if perf.brier_score is not none else '—' }}</span></div>
+        <div class=\"kv\"><span class=\"k\">Total analyses</span><span class=\"v\">{{ perf.decision_breakdown.total }}</span></div>
+        {% for row in perf.decision_breakdown.rows %}
+          <div class=\"metric-bar\">
+            <span class=\"label\">{{ row.label }}</span>
+            <span class=\"track\"><span class=\"fill {{ row.label|lower }}\" style=\"width: {{ row.pct }}%\"></span></span>
+            <span class=\"val\">{{ row.count }}</span>
           </div>
         {% endfor %}
+        <h3 style=\"margin-top: 14px;\">Top rejection reasons</h3>
+        {% if perf.top_rejections %}
+          <table class=\"rej-table\">
+            {% for r in perf.top_rejections %}
+              <tr><td>{{ r.reason }}</td><td class=\"count\">{{ r.count }}</td></tr>
+            {% endfor %}
+          </table>
+        {% else %}
+          <div class=\"empty\">no rejections yet</div>
+        {% endif %}
       </div>
-      <div class="panel">
-        <h3>Trend Chart: Quality</h3>
-        {% for row in trend_charts.quality %}
-          <div class="chart-row">
-            <div class="chart-label">{{ row.window }} accuracy</div>
-            <div class="chart-track"><div class="chart-fill accuracy" style="width: {{ row.accuracy_pct }}%"></div></div>
-            <div class="chart-val">{{ row.accuracy_pct }}%</div>
-          </div>
-          <div class="chart-row">
-            <div class="chart-label">{{ row.window }} brier quality</div>
-            <div class="chart-track"><div class="chart-fill brierq" style="width: {{ row.brier_quality_pct }}%"></div></div>
-            <div class="chart-val">{{ row.brier_quality_pct }}%</div>
+    </div>
+
+    <div class=\"grid cols-2\" style=\"margin-top: 14px;\">
+      <!-- Panel 3: Today's Analysis Feed -->
+      <div class=\"panel\">
+        <meta http-equiv=\"refresh\" content=\"30\" />
+        <div class=\"head\"><h2>Today's Analysis Feed</h2><span class=\"sub\">auto-refresh 30s</span></div>
+        <div class=\"cards\">
+          {% if todays_analyses %}
+            {% for a in todays_analyses %}
+              <div class=\"card-row\">
+                <div class=\"left\">
+                  <div class=\"market\">{{ a.market_id }}</div>
+                  <div class=\"meta\">
+                    conf={{ a.confidence }} · p={{ a.probability }} · edge={{ a.edge }} · provider={{ a.provider }}
+                  </div>
+                </div>
+                <span class=\"badge {{ a.decision_class }}\">{{ a.decision }}</span>
+              </div>
+            {% endfor %}
+          {% else %}
+            <div class=\"empty\">No analyses yet today — scheduler runs at 08:00 UTC</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- Panel 4: Risk Log -->
+      <div class=\"panel\">
+        <div class=\"head\"><h2>Risk Log</h2><span class=\"sub\">last 20 rejections</span></div>
+        <div class=\"cards\">
+          {% if risk_rejections %}
+            {% for r in risk_rejections %}
+              <div class=\"risk-row\">
+                <span class=\"ts\">{{ r.timestamp[:19] }}</span>
+                <span class=\"mkt\">{{ r.market_id }}</span>
+                <span class=\"badge {% if r.class == 'danger' %}red{% elif r.class == 'warning' %}grey{% elif r.class == 'info' %}grey{% else %}grey{% endif %}\"
+                      style=\"background: {% if r.class == 'danger' %}rgba(239,68,68,0.18); color: var(--bad);{% elif r.class == 'warning' %}rgba(245,158,11,0.18); color: var(--warn);{% elif r.class == 'info' %}rgba(56,189,248,0.18); color: var(--info);{% else %}#2d3443; color: #cbd5e1;{% endif %}\">{{ r.reason }}</span>
+              </div>
+            {% endfor %}
+          {% else %}
+            <div class=\"empty\">no recent rejections</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel 5: Prelive Checklist -->
+    <div class=\"panel\" style=\"margin-top: 14px;\">
+      <div class=\"head\"><h2>Pre-live Checklist</h2><span class=\"sub\">live gate status ({{ status.checklist_pass_count }}/{{ status.checklist_total }} PASS)</span></div>
+      {% for section in checklist_grouped %}
+        <div class=\"section-title\">{{ section.section }}</div>
+        {% for item in section.checks %}
+          <div class=\"check-item {% if item.passed %}pass{% else %}fail{% endif %}\">
+            <span class=\"sym\">{% if item.passed %}✓{% else %}✗{% endif %}</span>
+            <span>{{ item.name }}</span>
+            <span class=\"detail\" title=\"{{ item.detail }}\">{{ item.detail }}</span>
           </div>
         {% endfor %}
-      </div>
+      {% endfor %}
     </div>
 
-    <div class="row">
-      <form method="post" action="{{ url_for('action_scan') }}"><button class="a">Run Scan</button></form>
-      <form method="post" action="{{ url_for('action_preflight') }}"><button class="a">Run Preflight</button></form>
-      <form method="post" action="{{ url_for('action_scorecard') }}"><button class="a">Refresh Scorecard</button></form>
-      <form method="post" action="{{ url_for('action_prelive_checklist') }}"><button class="a">Run Prelive Checklist</button></form>
-      <form method="post" action="{{ url_for('action_replay_synthetic') }}">
-        <input type="hidden" name="days" value="3" />
-        <input type="hidden" name="loops_per_day" value="6" />
-        <input type="hidden" name="candidates_per_loop" value="5" />
-        <input type="hidden" name="approve_rate" value="0.45" />
-        <input type="hidden" name="resolved_rate" value="0.55" />
-        <select name="scenario">
-          <option value="bull_trend">Bull Trend</option>
-          <option value="chop">Chop</option>
-          <option value="event_shock">Event Shock</option>
-          <option value="default" selected>Default</option>
-        </select>
-        <button class="a">Run Synthetic Replay</button>
-      </form>
-      <form method="post" action="{{ url_for('action_resolve_outcomes') }}">
-        <input type="hidden" name="limit" value="200" />
-        <input type="hidden" name="dry_run" value="true" />
-        <input type="hidden" name="stub_mode" value="true" />
-        <button class="a">Run Resolver (Dry Stub)</button>
-      </form>
-      <form method="post" action="{{ url_for('action_usdc_check') }}"><button class="a">Run USDC Checks</button></form>
-      <form method="post" action="{{ url_for('action_send_alerts') }}"><button class="a">Send Alerts</button></form>
-      <form method="post" action="{{ url_for('action_kill_switch') }}"><input type="hidden" name="value" value="true" /><button class="d">Kill Switch ON</button></form>
-      <form method="post" action="{{ url_for('action_kill_switch') }}"><input type="hidden" name="value" value="false" /><button class="g">Kill Switch OFF</button></form>
+    <div class=\"toolbar\">
+      <form method=\"post\" action=\"{{ url_for('action_scan') }}\"><button class=\"btn\">Run Scan</button></form>
+      <form method=\"post\" action=\"{{ url_for('action_preflight') }}\"><button class=\"btn\">Preflight</button></form>
+      <form method=\"post\" action=\"{{ url_for('action_prelive_checklist') }}\"><button class=\"btn\">Re-run Checklist</button></form>
+      <form method=\"post\" action=\"{{ url_for('action_usdc_check') }}\"><button class=\"btn\">USDC Check</button></form>
+      <form method=\"post\" action=\"{{ url_for('action_send_alerts') }}\"><button class=\"btn\">Send Alerts</button></form>
+      <form method=\"post\" action=\"{{ url_for('action_kill_switch') }}\"><input type=\"hidden\" name=\"value\" value=\"true\" /><button class=\"btn danger\">Kill Switch ON</button></form>
+      <form method=\"post\" action=\"{{ url_for('action_kill_switch') }}\"><input type=\"hidden\" name=\"value\" value=\"false\" /><button class=\"btn good\">Kill Switch OFF</button></form>
     </div>
 
-    <div class="panel">
-      <h3>Recent Predictions</h3>
-      <table>
-        <thead><tr><th>ID</th><th>Market</th><th>P</th><th>Edge</th><th>Approved</th><th>Outcome</th></tr></thead>
-        <tbody>
-          {% for p in predictions %}
-            <tr><td>{{ p.id }}</td><td>{{ p.market_id }}</td><td>{{ p.calibrated_probability }}</td><td>{{ p.edge }}</td><td>{{ p.approved }}</td><td>{{ p.outcome }}</td></tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-
-    <div class="grid">
-      <div class="panel">
-        <h3>Recent Trades</h3>
-        <table><thead><tr><th>Market</th><th>Side</th><th>Size</th><th>Status</th><th>Type</th></tr></thead>
-        <tbody>
-          {% for t in trades %}
-            <tr><td>{{ t.market_id }}</td><td>{{ t.side }}</td><td>{{ t.size_usdc }}</td><td>{{ t.status }}</td><td>{{ t.order_type }}</td></tr>
-          {% endfor %}
-        </tbody></table>
-      </div>
-      <div class="panel">
-        <h3>Loop Events</h3>
-        <table><thead><tr><th>Candidates</th><th>Approved</th><th>Executed</th></tr></thead>
-        <tbody>
-          {% for row in loop_logs %}
-            <tr><td>{{ row.scan_candidates }}</td><td>{{ row.approved }}</td><td>{{ row.executed }}</td></tr>
-          {% endfor %}
-        </tbody></table>
-      </div>
-      <div class="panel">
-        <h3>Telemetry Snapshot (24h)</h3>
-        <table><thead><tr><th>Metric</th><th>Value</th></tr></thead>
-        <tbody>
-          <tr><td>loops_24h</td><td>{{ telemetry.loops_24h }}</td></tr>
-          <tr><td>no_candidate_loops_24h</td><td>{{ telemetry.no_candidate_loops_24h }}</td></tr>
-          <tr><td>trades_24h</td><td>{{ telemetry.trades_24h }}</td></tr>
-          <tr><td>risk_rejections_24h</td><td>{{ telemetry.risk_rejections_24h }}</td></tr>
-          <tr><td>trade_status_counts</td><td>{{ telemetry.trade_status_counts }}</td></tr>
-          <tr><td>top_rejection_reasons</td><td>{{ telemetry.top_rejection_reasons }}</td></tr>
-        </tbody></table>
-      </div>
-      <div class="panel">
-        <h3>Long-Window Trends</h3>
-        <table><thead><tr><th>Window</th><th>Resolved Accuracy</th><th>Avg Edge</th><th>PnL Proxy</th></tr></thead>
-        <tbody>
-          <tr><td>7d</td><td>{{ trends['7d'].resolved_accuracy }}</td><td>{{ trends['7d'].avg_edge }}</td><td>{{ trends['7d'].realized_pnl_proxy }}</td></tr>
-          <tr><td>30d</td><td>{{ trends['30d'].resolved_accuracy }}</td><td>{{ trends['30d'].avg_edge }}</td><td>{{ trends['30d'].realized_pnl_proxy }}</td></tr>
-        </tbody></table>
-      </div>
+    <div class=\"footer-links\">
+      <a href=\"{{ url_for('trades_view') }}\">Trade Lifecycle</a>
+      <a href=\"{{ url_for('api_status') }}\">/api/status</a>
+      <a href=\"{{ url_for('api_state') }}\">/api/state</a>
+      <a href=\"{{ url_for('api_prelive_report') }}\">/api/prelive-report</a>
+      <a href=\"{{ url_for('api_trends') }}\">/api/trends</a>
     </div>
   </div>
 </body>
@@ -411,25 +756,26 @@ DASHBOARD_HTML = """
 
 TRADE_LIFECYCLE_HTML = """
 <!doctype html>
-<html lang="en">
+<html lang=\"en\">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Trade Lifecycle Drilldown</title>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>Trade Lifecycle</title>
   <style>
-    body { margin: 0; background: #f5efe3; color: #1d2a35; font-family: "Trebuchet MS", "Segoe UI", sans-serif; }
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 20px; }
-    .panel { background: #fffdf8; border: 1px solid #dccfb8; border-radius: 12px; padding: 14px; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #dccfb8; font-size: 13px; }
-    a { color: #1f7a8c; }
+    body { margin: 0; background: #0f1117; color: #e5e7eb; font-family: system-ui, -apple-system, \"Segoe UI\", Roboto, sans-serif; font-size: 14px; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+    .panel { background: #1a1d27; border: 1px solid #2a2f3d; border-radius: 12px; padding: 14px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #2a2f3d; }
+    th { color: #9ca3af; text-transform: uppercase; font-size: 11px; letter-spacing: 0.6px; }
+    a { color: #6366f1; text-decoration: none; }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>Trade Lifecycle Drilldown</h1>
-    <div><a href="{{ url_for('home') }}">Back to Dashboard</a></div>
-    <div class="panel">
+  <div class=\"wrap\">
+    <h1 style=\"margin:0 0 8px;font-size:20px;\">Trade Lifecycle</h1>
+    <div style=\"margin-bottom:14px;\"><a href=\"{{ url_for('home') }}\">← Back to Dashboard</a></div>
+    <div class=\"panel\">
       <table>
         <thead>
           <tr>
@@ -471,7 +817,58 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
     app = Flask(__name__)
     app.secret_key = "polymarket-dashboard-local"
 
-    def _state() -> dict[str, Any]:
+    def _build_status(checks: list[Any]) -> dict[str, Any]:
+        provider_model = _resolve_provider_and_model()
+        warp = _warp_status()
+        live_mode = (os.getenv("BOT_LIVE_MODE", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
+        pass_count = sum(1 for c in checks if getattr(c, "passed", False))
+        return {
+            "provider": provider_model["provider"],
+            "model": provider_model["model"],
+            "warp": warp,
+            "paper_mode": not live_mode,
+            "uptime": _format_uptime(time.time() - _PROCESS_START_TS),
+            "now_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "checklist_pass_count": pass_count,
+            "checklist_total": len(checks),
+        }
+
+    def _home_state() -> dict[str, Any]:
+        config = load_config()
+
+        analyses_all = _read_jsonl_all(workspace_root / "data" / "analyses.jsonl")
+        risk_all = _read_jsonl_all(workspace_root / "data" / "risk_log.jsonl")
+        recent_risk = _read_jsonl(workspace_root / "data" / "risk_log.jsonl", limit=20)
+
+        checks = collect_pre_live_checks(workspace_root=workspace_root, db_path=config.storage.db_path)
+        status = _build_status(checks)
+        checklist_grouped = _group_checks_into_sections(checks)
+
+        brier_score = None
+        try:
+            store = PredictionStore(config.storage.db_path)
+            metrics = store.brier_metrics()
+            brier_score = metrics.brier_score
+        except Exception:  # noqa: BLE001
+            brier_score = None
+
+        perf = {
+            "brier_score": brier_score,
+            "decision_breakdown": _decision_breakdown(analyses_all),
+            "top_rejections": _top_rejection_reasons(risk_all, limit=3),
+        }
+
+        return {
+            "status": status,
+            "paper_days": _paper_days_progress(analyses_all),
+            "todays_analyses": _todays_analyses(analyses_all),
+            "risk_rejections": _build_rejection_rows(recent_risk),
+            "checklist_grouped": checklist_grouped,
+            "perf": perf,
+        }
+
+    def _legacy_state() -> dict[str, Any]:
+        """Retained for /api/state back-compat — preserves prior shape."""
         config = load_config()
         http = HttpClient(
             timeout_seconds=config.runtime.request_timeout_seconds,
@@ -492,11 +889,11 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
         rejected = int(summary.get("signals_rejected", 0))
         rejection_rate = (rejected / total_signals) if total_signals > 0 else None
         alerts = build_alerts(
-          telemetry=telemetry,
-          preflight_blocked=bool(preflight.blocked),
-          usdc_ready=usdc_report.ready,
-          rejection_rate=rejection_rate,
-          api_cost_usd=float(summary.get("api_cost_usd", 0.0)),
+            telemetry=telemetry,
+            preflight_blocked=bool(preflight.blocked),
+            usdc_ready=usdc_report.ready,
+            rejection_rate=rejection_rate,
+            api_cost_usd=float(summary.get("api_cost_usd", 0.0)),
         )
 
         store = PredictionStore(config.storage.db_path)
@@ -541,49 +938,77 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
 
     @app.get("/")
     def home() -> str:
-        state = _state()
+        state = _home_state()
         return render_template_string(
             DASHBOARD_HTML,
             **state,
-        flashes=get_flashed_messages(),
+            flashes=get_flashed_messages(),
+        )
+
+    @app.get("/api/status")
+    def api_status():
+        config = load_config()
+        analyses_all = _read_jsonl_all(workspace_root / "data" / "analyses.jsonl")
+        checks = collect_pre_live_checks(workspace_root=workspace_root, db_path=config.storage.db_path)
+        provider_model = _resolve_provider_and_model()
+        warp = _warp_status()
+        paper_days = _paper_days_progress(analyses_all)
+        pass_count = sum(1 for c in checks if getattr(c, "passed", False))
+        live_mode = (os.getenv("BOT_LIVE_MODE", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
+        return jsonify(
+            {
+                "provider": provider_model["provider"],
+                "model": provider_model["model"],
+                "warp_status": "on" if warp["ok"] else "off",
+                "warp_host": warp["host"],
+                "paper_mode": not live_mode,
+                "paper_days_done": paper_days["days_done"],
+                "paper_days_target": paper_days["target"],
+                "paper_days_pct": paper_days["pct"],
+                "checklist_pass_count": pass_count,
+                "checklist_total": len(checks),
+                "uptime_seconds": round(time.time() - _PROCESS_START_TS, 2),
+                "uptime": _format_uptime(time.time() - _PROCESS_START_TS),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
         )
 
     @app.get("/api/state")
     def api_state():
-        state = _state()
+        state = _legacy_state()
         state["preflight"] = asdict(state["preflight"])
         return jsonify(state)
 
     @app.get("/api/trades-lifecycle")
     def api_trades_lifecycle():
-      lifecycle = _build_trade_lifecycle(_read_jsonl(workspace_root / "data" / "trades.jsonl", limit=2000))
-      return jsonify({"count": len(lifecycle), "rows": lifecycle})
+        lifecycle = _build_trade_lifecycle(_read_jsonl(workspace_root / "data" / "trades.jsonl", limit=2000))
+        return jsonify({"count": len(lifecycle), "rows": lifecycle})
 
     @app.get("/api/trends")
     def api_trends():
-      config = load_config()
-      trends = build_trend_snapshot(workspace_root=workspace_root, db_path=config.storage.db_path)
-      return jsonify(trends)
+        config = load_config()
+        trends = build_trend_snapshot(workspace_root=workspace_root, db_path=config.storage.db_path)
+        return jsonify(trends)
 
     @app.get("/api/prelive-report")
     def api_prelive_report():
-      report = read_pre_live_report(workspace_root)
-      return jsonify(report or {"status": "missing"})
+        report = read_pre_live_report(workspace_root)
+        return jsonify(report or {"status": "missing"})
 
     @app.get("/api/replay-report")
     def api_replay_report():
-      report = read_synthetic_replay_report(workspace_root)
-      return jsonify(report or {"status": "missing"})
+        report = read_synthetic_replay_report(workspace_root)
+        return jsonify(report or {"status": "missing"})
 
     @app.get("/api/resolver-report")
     def api_resolver_report():
-      report = read_resolution_report(workspace_root)
-      return jsonify(report or {"status": "missing"})
+        report = read_resolution_report(workspace_root)
+        return jsonify(report or {"status": "missing"})
 
     @app.get("/trades")
     def trades_view() -> str:
-      lifecycle = _build_trade_lifecycle(_read_jsonl(workspace_root / "data" / "trades.jsonl", limit=2000))
-      return render_template_string(TRADE_LIFECYCLE_HTML, lifecycle=lifecycle)
+        lifecycle = _build_trade_lifecycle(_read_jsonl(workspace_root / "data" / "trades.jsonl", limit=2000))
+        return render_template_string(TRADE_LIFECYCLE_HTML, lifecycle=lifecycle)
 
     @app.post("/action/scan")
     def action_scan():
@@ -617,81 +1042,81 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
 
     @app.post("/action/prelive-checklist")
     def action_prelive_checklist():
-      config = load_config()
-      ready, checks = run_pre_live_checklist(workspace_root=workspace_root, db_path=config.storage.db_path)
-      write_pre_live_report(workspace_root=workspace_root, checks=checks, all_passed=ready)
-      failed = [c.name for c in checks if not c.passed]
-      flash(f"prelive ready={ready} failed_checks={','.join(failed) if failed else 'none'}")
-      return redirect(url_for("home"))
+        config = load_config()
+        ready, checks = run_pre_live_checklist(workspace_root=workspace_root, db_path=config.storage.db_path)
+        write_pre_live_report(workspace_root=workspace_root, checks=checks, all_passed=ready)
+        failed = [c.name for c in checks if not c.passed]
+        flash(f"prelive ready={ready} failed_checks={','.join(failed) if failed else 'none'}")
+        return redirect(url_for("home"))
 
     @app.post("/action/replay-synthetic")
     def action_replay_synthetic():
-      config = load_config()
-      scenario = (request.form.get("scenario") or "default").strip()
-      if scenario not in {"default", "bull_trend", "chop", "event_shock"}:
-        scenario = "default"
+        config = load_config()
+        scenario = (request.form.get("scenario") or "default").strip()
+        if scenario not in {"default", "bull_trend", "chop", "event_shock"}:
+            scenario = "default"
 
-      def _int(name: str, default: int) -> int:
-        raw = request.form.get(name)
-        try:
-          return max(1, int(str(raw)))
-        except (TypeError, ValueError):
-          return default
+        def _int(name: str, default: int) -> int:
+            raw = request.form.get(name)
+            try:
+                return max(1, int(str(raw)))
+            except (TypeError, ValueError):
+                return default
 
-      def _float(name: str, default: float) -> float:
-        raw = request.form.get(name)
-        try:
-          return float(str(raw))
-        except (TypeError, ValueError):
-          return default
+        def _float(name: str, default: float) -> float:
+            raw = request.form.get(name)
+            try:
+                return float(str(raw))
+            except (TypeError, ValueError):
+                return default
 
-      report = run_synthetic_replay(
-        workspace_root=workspace_root,
-        db_path=config.storage.db_path,
-        days=_int("days", 3),
-        loops_per_day=_int("loops_per_day", 6),
-        candidates_per_loop=_int("candidates_per_loop", 5),
-        approve_rate=_float("approve_rate", 0.45),
-        resolved_rate=_float("resolved_rate", 0.55),
-        scenario=scenario,
-        seed=7,
-        write_resolution_stub=True,
-      )
-      write_synthetic_replay_report(workspace_root, report)
-      flash(
-        f"replay scenario={report.scenario} predictions={report.predictions_written} "
-        f"loops={report.loops_written} outcomes={report.outcomes_written}"
-      )
-      return redirect(url_for("home"))
+        report = run_synthetic_replay(
+            workspace_root=workspace_root,
+            db_path=config.storage.db_path,
+            days=_int("days", 3),
+            loops_per_day=_int("loops_per_day", 6),
+            candidates_per_loop=_int("candidates_per_loop", 5),
+            approve_rate=_float("approve_rate", 0.45),
+            resolved_rate=_float("resolved_rate", 0.55),
+            scenario=scenario,
+            seed=7,
+            write_resolution_stub=True,
+        )
+        write_synthetic_replay_report(workspace_root, report)
+        flash(
+            f"replay scenario={report.scenario} predictions={report.predictions_written} "
+            f"loops={report.loops_written} outcomes={report.outcomes_written}"
+        )
+        return redirect(url_for("home"))
 
     @app.post("/action/resolve-outcomes")
     def action_resolve_outcomes():
-      config = load_config()
-      http = HttpClient(
-        timeout_seconds=config.runtime.request_timeout_seconds,
-        user_agent=config.runtime.user_agent,
-      )
-      store = PredictionStore(config.storage.db_path)
-      dry_run = (request.form.get("dry_run") or "true").strip().lower() in {"1", "true", "yes", "on"}
-      stub_mode = (request.form.get("stub_mode") or "true").strip().lower() in {"1", "true", "yes", "on"}
-      try:
-        limit = max(1, int(str(request.form.get("limit") or "200")))
-      except ValueError:
-        limit = 200
+        config = load_config()
+        http = HttpClient(
+            timeout_seconds=config.runtime.request_timeout_seconds,
+            user_agent=config.runtime.user_agent,
+        )
+        store = PredictionStore(config.storage.db_path)
+        dry_run = (request.form.get("dry_run") or "true").strip().lower() in {"1", "true", "yes", "on"}
+        stub_mode = (request.form.get("stub_mode") or "true").strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            limit = max(1, int(str(request.form.get("limit") or "200")))
+        except ValueError:
+            limit = 200
 
-      resolver = OutcomeResolver(
-        workspace_root=workspace_root,
-        http=http,
-        dry_run=dry_run,
-        stub_mode=stub_mode,
-      )
-      report = resolver.settle_unresolved_predictions(store=store, limit=limit)
-      write_resolution_report(workspace_root=workspace_root, report=report)
-      flash(
-        f"resolver checked={report.checked} resolved={report.resolved} "
-        f"applied={report.applied} dry_run={dry_run} stub_mode={stub_mode}"
-      )
-      return redirect(url_for("home"))
+        resolver = OutcomeResolver(
+            workspace_root=workspace_root,
+            http=http,
+            dry_run=dry_run,
+            stub_mode=stub_mode,
+        )
+        report = resolver.settle_unresolved_predictions(store=store, limit=limit)
+        write_resolution_report(workspace_root=workspace_root, report=report)
+        flash(
+            f"resolver checked={report.checked} resolved={report.resolved} "
+            f"applied={report.applied} dry_run={dry_run} stub_mode={stub_mode}"
+        )
+        return redirect(url_for("home"))
 
     @app.post("/action/kill-switch")
     def action_kill_switch():
@@ -702,25 +1127,25 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
 
     @app.post("/action/usdc-check")
     def action_usdc_check():
-      report = run_usdc_operational_checks(workspace_root)
-      failed = [c.name for c in report.checks if c.severity == "critical" and not c.passed]
-      flash(f"usdc ready={report.ready} critical_failures={','.join(failed) if failed else 'none'}")
-      return redirect(url_for("home"))
+        report = run_usdc_operational_checks(workspace_root)
+        failed = [c.name for c in report.checks if c.severity == "critical" and not c.passed]
+        flash(f"usdc ready={report.ready} critical_failures={','.join(failed) if failed else 'none'}")
+        return redirect(url_for("home"))
 
     @app.post("/action/send-alerts")
     def action_send_alerts():
-      state = _state()
-      result = dispatch_alerts(
-        workspace_root=workspace_root,
-        alerts=list(state.get("alerts", [])),
-        source="dashboard_action",
-        force=False,
-      )
-      flash(
-        f"alerts sent={result.sent} skipped={result.skipped} reason={result.reason} "
-        f"count={result.alerts_count}"
-      )
-      return redirect(url_for("home"))
+        state = _legacy_state()
+        result = dispatch_alerts(
+            workspace_root=workspace_root,
+            alerts=list(state.get("alerts", [])),
+            source="dashboard_action",
+            force=False,
+        )
+        flash(
+            f"alerts sent={result.sent} skipped={result.skipped} reason={result.reason} "
+            f"count={result.alerts_count}"
+        )
+        return redirect(url_for("home"))
 
     return app
 
