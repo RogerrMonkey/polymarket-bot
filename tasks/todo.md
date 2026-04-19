@@ -43,5 +43,11 @@
 - Completed: Replaced CryptoPanic (free tier discontinued 2026-04-01) with GDELT + RSS (feedparser); no API key required.
 - Completed: First real paper-loop run against live Polymarket markets via Cloudflare WARP — analyses.jsonl now has entries with `provider=groq` and real market IDs.
 - Completed: Checklist hardened with `paper_loop_has_run_today`, `news_feed_has_sources`, and WARP-aware network-error hints.
-- Note: Polymarket + polygon.llamarpc.com are DNS-blocked from India — Cloudflare WARP must be active on the machine for the scanner and RPC checks to reach real endpoints.
-- Pending: Accumulate >=14 distinct paper-analysis days and stable daily signal flow to clear Phase 9 gates.
+- Completed: Dashboard overhauled — dark theme (#0f1117), 6-panel layout (status bar, paper progress, analysis feed, risk log, prelive checklist, performance), `/api/status` JSON endpoint, Flask endpoint tests added. 96/96 tests passing.
+- Completed: POLYGON_RPC_URL switched to 1rpc.io/matic (free, keyless, no WARP needed); USDC onramp/offramp set to transak; env dotenv comment bug fixed. prelive-checklist: 12/19 PASS.
+- Completed: `scripts/setup_scheduler_windows.ps1` — registers PolymarketPaperLoop daily task at 03:00 UTC (08:30 IST) via Task Scheduler COM object with WARP reminder block.
+- Completed: Paper day 4 banked — 30 analyses via provider=groq; paper_loop_has_run_today PASS. Tagged v0.8.2.
+- Note: Polymarket + polygon.llamarpc.com are DNS-blocked from India — Cloudflare WARP must be active for CLOB/Gamma/WS checks. polygon.llamarpc.com replaced with 1rpc.io/matic for RPC (no WARP needed).
+- Pending: Fill POLYMARKET_PRIVATE_KEY + POLYMARKET_FUNDER_ADDRESS in .env (MetaMask keys) to unlock wallet/auth checks.
+- Pending: Accumulate >=14 distinct paper-analysis days (currently 4/14) and stable daily signal flow to clear Phase 9 gates.
+- Pending: Run `scripts/setup_scheduler_windows.ps1` to register the daily paper-loop task so days accumulate automatically.
