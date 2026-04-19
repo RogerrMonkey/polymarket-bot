@@ -13,6 +13,7 @@ from prediction_bot.models import ResearchSignal, RiskDecision, ScanCandidate, T
 from prediction_bot.pipeline.compliance import PreflightStatus, run_preflight
 from prediction_bot.pipeline.ingest import UnifiedIngestor
 from prediction_bot.pipeline.research import ResearchPipeline
+from prediction_bot.research.market_filter import filter_markets
 from prediction_bot.research.news_feed import NewsItem, get_relevant_news
 from prediction_bot.risk_engine import AnalysisResult as DeterministicAnalysisResult
 from prediction_bot.risk_engine import PortfolioState, RiskConfig, pre_trade_check
@@ -137,6 +138,11 @@ def execute_scan_run(
     scanner = MarketScanner(config.scan)
     candidates = scanner.scan(ingestion.snapshots)
 
+    # Pre-analyst quality filter: removes thin/expired/near-certain/malformed markets
+    # so we don't waste Groq calls on markets with no analysable edge.
+    risk_config = RiskConfig.from_json_file(root / "risk_config.json")
+    candidates = filter_markets(candidates, risk_config)
+
     research_signals: dict[str, ResearchSignal] = {}
     if config.research.enabled and candidates:
         research = ResearchPipeline(
@@ -168,7 +174,6 @@ def execute_scan_run(
 
     calibrator = ProbabilityCalibrator(config.calibration)
 
-    risk_config = RiskConfig.from_json_file(root / "risk_config.json")
     portfolio = PortfolioState.from_json_file(
         root / "data" / "portfolio_state.json",
         default_starting_balance=100.0,

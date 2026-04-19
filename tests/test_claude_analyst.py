@@ -15,9 +15,11 @@ from prediction_bot.claude_analyst import (
     OllamaProvider,
     ProviderResponse,
     StubProvider,
+    _extract_description,
     build_prompt,
     build_provider_chain,
     detect_category,
+    select_relevant_news,
 )
 from prediction_bot.models import MarketSnapshot
 from prediction_bot.research.news_feed import NewsItem
@@ -477,3 +479,106 @@ def test_groq_mock_returns_reasoning_field(monkeypatch, tmp_path: Path) -> None:
     result = analyst.analyze(market=_market(), news_items=[], chainlink_price=None)
     assert result.reasoning == "groq says so"
     assert result.provider == "groq"
+
+
+# --------------------------------------------------------------------------- #
+# v0.8.4: news relevance selector + market description extractor
+# --------------------------------------------------------------------------- #
+
+
+def _news_item(title: str, raw: str = "") -> NewsItem:
+    return NewsItem(
+        title=title,
+        source="test",
+        url="http://example.com",
+        published_at=datetime.now(timezone.utc),
+        raw_text=raw or title,
+        relevance_score=1.0,
+        sentiment="neutral",
+    )
+
+
+def test_select_relevant_news_ranks_by_keyword_overlap() -> None:
+    question = "Will Bitcoin close above 100k by year end?"
+    items = [
+        _news_item("Chiefs win Super Bowl again", "NFL final recap"),
+        _news_item("Bitcoin breaks 95k mark as ETF inflows surge", "BTC rally details"),
+        _news_item("Fed signals pause on rate hikes", "macro commentary"),
+        _news_item("BTC year-end outlook: analysts call 100k possible", "bitcoin close target"),
+    ]
+    picked = select_relevant_news(question, items, top_n=3)
+    titles = [i.title for i in picked]
+    assert "Bitcoin breaks 95k mark as ETF inflows surge" in titles
+    assert "BTC year-end outlook: analysts call 100k possible" in titles
+    # Unrelated Super Bowl item should NOT be picked
+    assert "Chiefs win Super Bowl again" not in titles
+
+
+def test_select_relevant_news_returns_empty_when_no_overlap() -> None:
+    question = "Will the Fed cut rates in March?"
+    items = [
+        _news_item("NBA playoffs bracket update", "lakers celtics"),
+        _news_item("Crypto ETF roundup", "bitcoin ethereum"),
+    ]
+    picked = select_relevant_news(question, items, top_n=3)
+    assert picked == []
+
+
+def test_select_relevant_news_handles_empty_input() -> None:
+    assert select_relevant_news("anything", [], top_n=3) == []
+
+
+def test_extract_description_returns_empty_when_missing() -> None:
+    market = MarketSnapshot(
+        venue="polymarket", market_id="x", question="q", yes_price=0.5, no_price=0.5,
+        spread=0.01, volume=1000, liquidity=1000, expires_at=None, raw={},
+    )
+    assert _extract_description(market) == ""
+
+
+def test_extract_description_truncates_to_300_chars() -> None:
+    long = "x" * 500
+    market = MarketSnapshot(
+        venue="polymarket", market_id="x", question="q", yes_price=0.5, no_price=0.5,
+        spread=0.01, volume=1000, liquidity=1000, expires_at=None,
+        raw={"description": long},
+    )
+    out = _extract_description(market)
+    assert len(out) <= 300
+    assert out.endswith("…")
+
+
+def test_build_prompt_includes_description_and_only_relevant_news() -> None:
+    market = MarketSnapshot(
+        venue="polymarket",
+        market_id="m1",
+        question="Will Bitcoin close above 100k by year end?",
+        yes_price=0.45,
+        no_price=0.55,
+        spread=0.02,
+        volume=200000.0,
+        liquidity=50000.0,
+        expires_at=None,
+        raw={"description": "Resolves YES if BTC/USD closes at or above 100000 on Coinbase Dec 31."},
+    )
+    news = [
+        _news_item("Chiefs win Super Bowl again", "Chiefs win Super Bowl again - NFL final"),
+        _news_item("Bitcoin rallies above 95k on ETF flows", "Bitcoin rallies above 95k on ETF flows"),
+    ]
+    prompt = build_prompt(market, news, chainlink_price=None)
+    assert "MARKET_DESCRIPTION" in prompt
+    assert "Coinbase" in prompt
+    assert "Bitcoin rallies above 95k" in prompt
+    assert "Super Bowl" not in prompt  # filtered by relevance
+
+
+def test_build_prompt_reports_no_relevant_news_when_nothing_matches() -> None:
+    market = MarketSnapshot(
+        venue="polymarket", market_id="m1",
+        question="Will the Fed cut rates in March?",
+        yes_price=0.5, no_price=0.5, spread=0.02,
+        volume=20000.0, liquidity=25000.0, expires_at=None, raw={},
+    )
+    news = [_news_item("NBA playoffs bracket update", "lakers celtics")]
+    prompt = build_prompt(market, news, chainlink_price=None)
+    assert "no_relevant_news_found_for_this_market" in prompt

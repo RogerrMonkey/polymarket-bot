@@ -506,6 +506,7 @@ _CHECK_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "paper_gates_passed",
             "paper_minimum_14_days",
             "paper_loop_has_run_today",
+            "scheduled_job_registered",
         ),
     ),
     (

@@ -1,5 +1,5 @@
 # =============================================================================
-# setup_scheduler_windows.ps1 — Register the PolymarketPaperLoop daily task
+# setup_scheduler_windows.ps1 - Register the PolymarketPaperLoop daily task
 # =============================================================================
 #
 # IMPORTANT: Cloudflare WARP must be active BEFORE this task fires.
@@ -17,7 +17,7 @@
 #
 #   Optional parameters:
 #       -TaskName   (default: PolymarketPaperLoop)
-#       -TriggerUTC (default: 03:00  — 08:30 IST)
+#       -TriggerUTC (default: 03:00  - 08:30 IST)
 #       -Cycles     (default: 20)
 #       -Interval   (default: 60  seconds between cycles)
 #
@@ -58,7 +58,7 @@ Write-Host "Trigger UTC  : $TriggerUTC daily"
 Write-Host ""
 
 # ---------------------------------------------------------------------------
-# Build trigger: daily at $TriggerUTC in UTC — StartBoundary must use a
+# Build trigger: daily at $TriggerUTC in UTC - StartBoundary must use a
 # full ISO-8601 datetime; we use today's date to anchor it.
 # ---------------------------------------------------------------------------
 $Today     = (Get-Date).ToString("yyyy-MM-dd")
@@ -72,7 +72,7 @@ $scheduler.Connect()
 
 $taskDef    = $scheduler.NewTask(0)
 $taskDef.RegistrationInfo.Description = `
-    "Polymarket Bot — daily paper-loop analysis run. WARP must be active before this fires."
+    "Polymarket Bot - daily paper-loop analysis run. WARP must be active before this fires."
 $taskDef.RegistrationInfo.Author      = $env:USERNAME
 $taskDef.Settings.Enabled             = $true
 $taskDef.Settings.Hidden              = $false

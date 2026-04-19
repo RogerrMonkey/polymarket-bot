@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-import os
 import importlib
+import os
+import re
 from dataclasses import dataclass
 from typing import Any
+
+_HEX_PRIVATE_KEY_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 @dataclass(frozen=True)
@@ -33,11 +36,37 @@ def _required_env(name: str) -> str:
     return value.strip()
 
 
+def _normalize_private_key(raw: str) -> str:
+    """Strip optional 0x prefix; reject obviously malformed hex."""
+    candidate = raw.strip()
+    if candidate.lower().startswith("0x"):
+        candidate = candidate[2:]
+    if not _HEX_PRIVATE_KEY_RE.match(candidate):
+        raise RuntimeError(
+            "POLYMARKET_PRIVATE_KEY must be 64 hex chars (32 bytes), "
+            "with or without 0x prefix"
+        )
+    return candidate
+
+
+def _normalize_funder_address(raw: str) -> str:
+    """Return EIP-55 checksummed address. Falls back to raw on import failure."""
+    candidate = raw.strip()
+    try:
+        from web3 import Web3  # type: ignore
+
+        return Web3.to_checksum_address(candidate)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"POLYMARKET_FUNDER_ADDRESS invalid or not checksummable: {exc}"
+        ) from exc
+
+
 def load_auth_settings() -> AuthSettings:
     _load_dotenv_if_available()
 
-    private_key = _required_env("POLYMARKET_PRIVATE_KEY")
-    funder_address = _required_env("POLYMARKET_FUNDER_ADDRESS")
+    private_key = _normalize_private_key(_required_env("POLYMARKET_PRIVATE_KEY"))
+    funder_address = _normalize_funder_address(_required_env("POLYMARKET_FUNDER_ADDRESS"))
     anthropic_api_key = _required_env("ANTHROPIC_API_KEY")
 
     signature_raw = os.getenv("SIGNATURE_TYPE", "1").strip()

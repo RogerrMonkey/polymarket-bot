@@ -34,12 +34,17 @@ def test_collect_pre_live_checks_aggregates(monkeypatch, tmp_path: Path) -> None
         "_check_news_feed_has_sources",
         lambda root: checklist.ChecklistItem("news_sources", True, "ok"),
     )
+    monkeypatch.setattr(
+        checklist,
+        "_check_scheduled_job_registered",
+        lambda: checklist.ChecklistItem("scheduled_job_registered", True, "ok"),
+    )
     monkeypatch.setattr(checklist, "_check_access", lambda: [checklist.ChecklistItem("access", True, "ok")])
 
     ready, items = checklist.run_pre_live_checklist(workspace_root=tmp_path, db_path=str(tmp_path / "db.sqlite"))
 
     assert ready is True
-    assert len(items) == 11
+    assert len(items) == 12
 
 
 def test_run_pre_live_checklist_fails_on_any_check(monkeypatch, tmp_path: Path) -> None:
@@ -51,6 +56,61 @@ def test_run_pre_live_checklist_fails_on_any_check(monkeypatch, tmp_path: Path) 
     ready, items = checklist.run_pre_live_checklist(workspace_root=tmp_path, db_path="x")
     assert ready is False
     assert len(items) == 2
+
+
+def test_check_scheduled_job_registered_skips_on_non_windows(monkeypatch) -> None:
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    item = checklist._check_scheduled_job_registered()
+    assert item.name == "scheduled_job_registered"
+    assert item.passed is True
+    assert "non_windows_skip" in item.detail
+
+
+def test_check_scheduled_job_registered_pass(monkeypatch) -> None:
+    import subprocess as _sp
+
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+
+    class _CompletedOK:
+        returncode = 0
+        stdout = "TaskName: PolymarketPaperLoop\nStatus:    Ready\n"
+        stderr = ""
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **kw: _CompletedOK())
+    item = checklist._check_scheduled_job_registered()
+    assert item.passed is True
+    assert "registered" in item.detail.lower()
+    assert "Ready" in item.detail
+
+
+def test_check_scheduled_job_registered_fail_not_registered(monkeypatch) -> None:
+    import subprocess as _sp
+
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+
+    class _CompletedFail:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: The system cannot find the file specified.\n"
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **kw: _CompletedFail())
+    item = checklist._check_scheduled_job_registered()
+    assert item.passed is False
+    assert "not_registered" in item.detail
+
+
+def test_check_scheduled_job_registered_handles_missing_schtasks(monkeypatch) -> None:
+    import subprocess as _sp
+
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+
+    def _raise(*a, **kw):
+        raise FileNotFoundError("schtasks not on PATH")
+
+    monkeypatch.setattr(_sp, "run", _raise)
+    item = checklist._check_scheduled_job_registered()
+    assert item.passed is False
+    assert item.detail == "schtasks_cli_not_found"
 
 
 def test_write_and_read_prelive_report(tmp_path: Path) -> None:

@@ -333,6 +333,46 @@ def _check_news_feed_has_sources(workspace_root: Path) -> ChecklistItem:
     )
 
 
+def _check_scheduled_job_registered() -> ChecklistItem:
+    """Windows-only: pass if PolymarketPaperLoop Scheduled Task is registered.
+
+    Gracefully skips with PASS on non-Windows (no scheduler expected there).
+    Uses `schtasks /query` so we don't depend on PowerShell COM access.
+    """
+    import platform
+    import subprocess
+
+    name = "scheduled_job_registered"
+    if platform.system() != "Windows":
+        return ChecklistItem(name, True, "non_windows_skip")
+
+    try:
+        result = subprocess.run(
+            ["schtasks", "/query", "/tn", "PolymarketPaperLoop", "/fo", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        return ChecklistItem(name, False, "schtasks_cli_not_found")
+    except subprocess.TimeoutExpired:
+        return ChecklistItem(name, False, "schtasks_query_timeout")
+    except Exception as exc:  # noqa: BLE001
+        return ChecklistItem(name, False, f"schtasks_query_error:{exc}")
+
+    if result.returncode != 0:
+        hint = (result.stderr or result.stdout or "").strip().splitlines()[:1]
+        detail = f"not_registered exit={result.returncode} {hint[0] if hint else ''}".strip()
+        return ChecklistItem(name, False, detail)
+
+    status_line = ""
+    for line in (result.stdout or "").splitlines():
+        if line.lower().startswith("status"):
+            status_line = line.split(":", 1)[-1].strip()
+            break
+    return ChecklistItem(name, True, f"registered status={status_line or 'unknown'}")
+
+
 def _check_paper_gates(workspace_root: Path, db_path: str) -> list[ChecklistItem]:
     ready, failures = check_paper_gates(workspace_root=workspace_root, db_path=db_path)
     days = _analysis_days(workspace_root)
@@ -379,6 +419,7 @@ def collect_pre_live_checks(workspace_root: Path, db_path: str) -> list[Checklis
     checks.extend(_check_paper_gates(workspace_root, db_path))
     checks.append(_check_paper_loop_has_run_today(workspace_root))
     checks.append(_check_news_feed_has_sources(workspace_root))
+    checks.append(_check_scheduled_job_registered())
     checks.extend(_check_access())
     return checks
 
