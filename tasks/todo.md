@@ -47,6 +47,7 @@
 - Completed: POLYGON_RPC_URL switched to 1rpc.io/matic (free, keyless, no WARP needed); USDC onramp/offramp set to transak; env dotenv comment bug fixed. prelive-checklist: 12/19 PASS.
 - Completed: `scripts/setup_scheduler_windows.ps1` — registers PolymarketPaperLoop daily task at 03:00 UTC (08:30 IST) via Task Scheduler COM object with WARP reminder block.
 - Completed: Paper day 4 banked — 30 analyses via provider=groq; paper_loop_has_run_today PASS. Tagged v0.8.2.
+- Completed: v0.8.3 — analyst prompt v2 (SYSTEM_PROMPT rewrite, `detect_category`, volume tiers, 200-char reasoning), Kelly-adjusted edge (`compute_edge_breakdown` with vol_weight + time_decay), `BOT_MIN_KELLY_FRACTION=0.05`/`BOT_MIN_VOLUME_24H=5000` gates in risk_engine, `reasoning` persisted into analyses.jsonl, dashboard v2 (clickable polymarket.com market links, reasoning shown under analysis cards, edge breakdown shown under risk-log entries, new 7-day Trends panel). 111/111 tests passing (added 15 new).
 - Note: Polymarket + polygon.llamarpc.com are DNS-blocked from India — Cloudflare WARP must be active for CLOB/Gamma/WS checks. polygon.llamarpc.com replaced with 1rpc.io/matic for RPC (no WARP needed).
 - Pending: Fill POLYMARKET_PRIVATE_KEY + POLYMARKET_FUNDER_ADDRESS in .env (MetaMask keys) to unlock wallet/auth checks.
 - Pending: Accumulate >=14 distinct paper-analysis days (currently 4/14) and stable daily signal flow to clear Phase 9 gates.

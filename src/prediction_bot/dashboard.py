@@ -313,6 +313,13 @@ def _paper_days_progress(analyses: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _polymarket_url(market_id: str) -> str:
+    mid = (market_id or "").strip()
+    if not mid:
+        return ""
+    return f"https://polymarket.com/event/{mid}"
+
+
 def _todays_analyses(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
     today = datetime.now(timezone.utc).date()
     out: list[dict[str, Any]] = []
@@ -326,20 +333,86 @@ def _todays_analyses(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
             decision_class = "green"
         elif decision in {"NO", "SELL"}:
             decision_class = "red"
+        market_id = str(row.get("market_id") or "")
+        reasoning = str(row.get("reasoning") or "").strip()
+        if len(reasoning) > 200:
+            reasoning = reasoning[:200]
         out.append(
             {
                 "timestamp": row.get("timestamp"),
-                "market_id": str(row.get("market_id") or ""),
+                "market_id": market_id,
+                "polymarket_url": _polymarket_url(market_id),
                 "decision": decision or "SKIP",
                 "decision_class": decision_class,
                 "confidence": str(row.get("confidence") or ""),
                 "probability": row.get("probability"),
                 "edge": row.get("edge"),
                 "provider": str(row.get("provider") or ""),
+                "reasoning": reasoning,
             }
         )
     out.sort(key=lambda r: str(r.get("timestamp") or ""), reverse=True)
     return out
+
+
+def _seven_day_trends(analyses: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a 7-day rolling window of analysis counts + avg confidence."""
+    today = datetime.now(timezone.utc).date()
+    buckets: dict[str, dict[str, Any]] = {}
+    for i in range(6, -1, -1):
+        day = (today - timedelta(days=i)).isoformat()
+        buckets[day] = {"date": day, "count": 0, "buy": 0, "sell": 0, "skip": 0, "conf_sum": 0.0, "conf_n": 0}
+
+    conf_score = {"high": 1.0, "medium": 0.5, "low": 0.0}
+    for row in analyses:
+        ts = _parse_iso(str(row.get("timestamp") or ""))
+        if ts is None:
+            continue
+        key = ts.date().isoformat()
+        if key not in buckets:
+            continue
+        b = buckets[key]
+        b["count"] += 1
+        d = str(row.get("decision") or "").upper()
+        if d in {"BUY", "YES"}:
+            b["buy"] += 1
+        elif d in {"SELL", "NO"}:
+            b["sell"] += 1
+        else:
+            b["skip"] += 1
+        c = str(row.get("confidence") or "").strip().lower()
+        if c in conf_score:
+            b["conf_sum"] += conf_score[c]
+            b["conf_n"] += 1
+
+    rows: list[dict[str, Any]] = []
+    max_count = max((b["count"] for b in buckets.values()), default=0)
+    for day in sorted(buckets.keys()):
+        b = buckets[day]
+        avg_conf = (b["conf_sum"] / b["conf_n"]) if b["conf_n"] else None
+        if avg_conf is None:
+            avg_label = "—"
+        elif avg_conf >= 0.67:
+            avg_label = "High"
+        elif avg_conf >= 0.34:
+            avg_label = "Medium"
+        else:
+            avg_label = "Low"
+        pct = int(round((b["count"] / max_count) * 100.0)) if max_count else 0
+        rows.append(
+            {
+                "date": day[5:],  # MM-DD
+                "count": b["count"],
+                "buy": b["buy"],
+                "sell": b["sell"],
+                "skip": b["skip"],
+                "avg_confidence": avg_label,
+                "bar_pct": pct,
+            }
+        )
+
+    total_7d = sum(r["count"] for r in rows)
+    return {"rows": rows, "total_7d": total_7d, "max_count": max_count}
 
 
 def _classify_rejection_reason(reason: str) -> str:
@@ -357,12 +430,21 @@ def _build_rejection_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for row in rows:
         reason = str(row.get("reason") or "")
+        market_id = str(row.get("market_id") or "")
+        breakdown_raw = row.get("edge_breakdown") or {}
+        breakdown: dict[str, Any] = {}
+        if isinstance(breakdown_raw, dict):
+            for key in ("kelly", "vol_weight", "time_decay", "final_edge", "raw_edge"):
+                if key in breakdown_raw:
+                    breakdown[key] = breakdown_raw[key]
         out.append(
             {
                 "timestamp": str(row.get("timestamp") or ""),
-                "market_id": str(row.get("market_id") or ""),
+                "market_id": market_id,
+                "polymarket_url": _polymarket_url(market_id),
                 "reason": reason,
                 "class": _classify_rejection_reason(reason),
+                "breakdown": breakdown,
             }
         )
     return out
@@ -556,7 +638,20 @@ DASHBOARD_HTML = """
       padding: 8px 10px; display: grid; grid-template-columns: 1fr auto; gap: 4px; align-items: center;
     }
     .card-row .left .market { font-family: var(--mono); font-size: 13px; color: var(--ink); }
+    .card-row .left .market a { color: #a5b4fc; }
+    .card-row .left .market a:hover { color: var(--accent); }
     .card-row .left .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .card-row .left .reasoning { color: #cbd5e1; font-size: 12px; margin-top: 4px; font-style: italic; line-height: 1.35; }
+    .risk-row .mkt a { color: #c7d2fe; }
+    .risk-row .mkt a:hover { color: var(--accent); }
+    .risk-row .breakdown { color: var(--muted); font-family: var(--mono); font-size: 11px; margin-top: 2px; }
+    .trend-row { display: grid; grid-template-columns: 60px 1fr 80px 60px; gap: 8px; align-items: center; padding: 4px 0; font-size: 12.5px; border-bottom: 1px solid var(--line); }
+    .trend-row:last-child { border-bottom: 0; }
+    .trend-row .date { font-family: var(--mono); color: var(--muted); }
+    .trend-row .bar-cell { background: var(--panel-2); height: 14px; border-radius: 4px; overflow: hidden; }
+    .trend-row .bar-cell .fill { background: linear-gradient(90deg, var(--accent-dim), var(--accent)); height: 14px; }
+    .trend-row .conf { font-family: var(--mono); font-size: 11px; color: var(--info); }
+    .trend-row .count { text-align: right; font-family: var(--mono); color: var(--ink); }
     .badge {
       display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700;
       font-family: var(--mono); letter-spacing: 0.4px;
@@ -682,10 +777,19 @@ DASHBOARD_HTML = """
             {% for a in todays_analyses %}
               <div class=\"card-row\">
                 <div class=\"left\">
-                  <div class=\"market\">{{ a.market_id }}</div>
+                  <div class=\"market\">
+                    {% if a.polymarket_url %}
+                      <a href=\"{{ a.polymarket_url }}\" target=\"_blank\" rel=\"noopener noreferrer\">{{ a.market_id }}</a>
+                    {% else %}
+                      {{ a.market_id }}
+                    {% endif %}
+                  </div>
                   <div class=\"meta\">
                     conf={{ a.confidence }} · p={{ a.probability }} · edge={{ a.edge }} · provider={{ a.provider }}
                   </div>
+                  {% if a.reasoning %}
+                    <div class=\"reasoning\">“{{ a.reasoning }}”</div>
+                  {% endif %}
                 </div>
                 <span class=\"badge {{ a.decision_class }}\">{{ a.decision }}</span>
               </div>
@@ -704,7 +808,21 @@ DASHBOARD_HTML = """
             {% for r in risk_rejections %}
               <div class=\"risk-row\">
                 <span class=\"ts\">{{ r.timestamp[:19] }}</span>
-                <span class=\"mkt\">{{ r.market_id }}</span>
+                <span class=\"mkt\">
+                  {% if r.polymarket_url %}
+                    <a href=\"{{ r.polymarket_url }}\" target=\"_blank\" rel=\"noopener noreferrer\">{{ r.market_id }}</a>
+                  {% else %}
+                    {{ r.market_id }}
+                  {% endif %}
+                  {% if r.breakdown %}
+                    <div class=\"breakdown\">
+                      {% if r.breakdown.kelly is defined %}kelly={{ r.breakdown.kelly }}{% endif %}
+                      {% if r.breakdown.vol_weight is defined %} · vol×{{ r.breakdown.vol_weight }}{% endif %}
+                      {% if r.breakdown.time_decay is defined %} · time×{{ r.breakdown.time_decay }}{% endif %}
+                      {% if r.breakdown.final_edge is defined %} · final={{ r.breakdown.final_edge }}{% endif %}
+                    </div>
+                  {% endif %}
+                </span>
                 <span class=\"badge {% if r.class == 'danger' %}red{% elif r.class == 'warning' %}grey{% elif r.class == 'info' %}grey{% else %}grey{% endif %}\"
                       style=\"background: {% if r.class == 'danger' %}rgba(239,68,68,0.18); color: var(--bad);{% elif r.class == 'warning' %}rgba(245,158,11,0.18); color: var(--warn);{% elif r.class == 'info' %}rgba(56,189,248,0.18); color: var(--info);{% else %}#2d3443; color: #cbd5e1;{% endif %}\">{{ r.reason }}</span>
               </div>
@@ -714,6 +832,23 @@ DASHBOARD_HTML = """
           {% endif %}
         </div>
       </div>
+    </div>
+
+    <!-- Panel 7: 7-day Trends -->
+    <div class=\"panel\" style=\"margin-top: 14px;\">
+      <div class=\"head\"><h2>7-day Trends</h2><span class=\"sub\">total analyses: {{ trends_7d.total_7d }}</span></div>
+      {% if trends_7d.max_count %}
+        {% for t in trends_7d.rows %}
+          <div class=\"trend-row\">
+            <span class=\"date\">{{ t.date }}</span>
+            <span class=\"bar-cell\"><span class=\"fill\" style=\"width: {{ t.bar_pct }}%\"></span></span>
+            <span class=\"conf\">conf {{ t.avg_confidence }}</span>
+            <span class=\"count\">{{ t.count }}</span>
+          </div>
+        {% endfor %}
+      {% else %}
+        <div class=\"empty\">no analyses in last 7 days</div>
+      {% endif %}
     </div>
 
     <!-- Panel 5: Prelive Checklist -->
@@ -865,6 +1000,7 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
             "risk_rejections": _build_rejection_rows(recent_risk),
             "checklist_grouped": checklist_grouped,
             "perf": perf,
+            "trends_7d": _seven_day_trends(analyses_all),
         }
 
     def _legacy_state() -> dict[str, Any]:

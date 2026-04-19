@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from prediction_bot.models import MarketSnapshot
 
 
@@ -34,6 +36,9 @@ class RiskConfig:
     kelly_fraction: float = 0.25
     min_liquidity_usdc: float = 10000.0
     kill_switch: bool = False
+    # v0.8.3 edge-quality gates
+    min_kelly_fraction: float = 0.05
+    min_volume_24h: float = 5000.0
 
     @classmethod
     def from_json_file(cls, path: str | Path) -> "RiskConfig":
@@ -117,6 +122,77 @@ class PortfolioState:
         self._atomic_save()
 
 
+def _volume_weight(volume: float | None) -> float:
+    """Edge multiplier based on 24h volume.
+
+    Thin markets have wide spreads that eat edge; very liquid markets reward it.
+    """
+    v = float(volume or 0.0)
+    if v < 5_000:
+        return 0.5
+    if v < 50_000:
+        return 1.0
+    return 1.2
+
+
+def _time_decay_weight(market: MarketSnapshot) -> float:
+    """Edge multiplier based on days to resolution.
+
+    <3 days: price largely locked, discount edge heavily.
+    """
+    days = market.time_to_expiry_days
+    if days is None:
+        return 1.0
+    if days < 3.0:
+        return 0.3
+    return 1.0
+
+
+def compute_edge_breakdown(
+    raw_edge: float,
+    decision: str,
+    market: MarketSnapshot,
+) -> dict[str, float]:
+    """Return the full edge calculation breakdown.
+
+    - raw_edge:   |model_probability - market_price| as passed in
+    - kelly:      edge-to-payoff ratio (fraction of bankroll to bet, unscaled)
+    - vol_weight: volume-tier multiplier
+    - time_decay: days-to-resolution multiplier
+    - final_edge: raw_edge * vol_weight * time_decay
+    """
+    market_price = market.yes_price if market.yes_price is not None else 0.5
+
+    decision_u = (decision or "").upper()
+    if decision_u == "YES" or decision_u == "BUY":
+        denom = max(1e-9, 1.0 - market_price)
+    else:
+        denom = max(1e-9, market_price)
+    kelly = raw_edge / denom
+
+    vol_weight = _volume_weight(market.volume)
+    time_decay = _time_decay_weight(market)
+    final_edge = raw_edge * vol_weight * time_decay
+
+    breakdown = {
+        "raw_edge": round(float(raw_edge), 6),
+        "kelly": round(float(kelly), 6),
+        "vol_weight": round(float(vol_weight), 4),
+        "time_decay": round(float(time_decay), 4),
+        "final_edge": round(float(final_edge), 6),
+    }
+    logger.debug(
+        "edge_calc market={} raw_edge={} kelly={} vol_weight={} time_decay={} final_edge={}",
+        market.market_id,
+        breakdown["raw_edge"],
+        breakdown["kelly"],
+        breakdown["vol_weight"],
+        breakdown["time_decay"],
+        breakdown["final_edge"],
+    )
+    return breakdown
+
+
 @dataclass(frozen=True)
 class AnalysisResult:
     probability: float
@@ -131,6 +207,7 @@ def _log_rejection(
     analysis: AnalysisResult,
     market: MarketSnapshot,
     log_path: str | Path,
+    breakdown: dict[str, float] | None = None,
 ) -> None:
     entry = {
         "timestamp": _utc_now_iso(),
@@ -143,6 +220,8 @@ def _log_rejection(
             "edge": analysis.edge,
         },
     }
+    if breakdown is not None:
+        entry["edge_breakdown"] = breakdown
 
     path = Path(log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,14 +261,26 @@ def pre_trade_check(
         _log_rejection(reason, analysis, market, log_path)
         return False, reason, 0.0
 
-    if analysis.edge < config.min_edge:
-        reason = "Insufficient edge"
-        _log_rejection(reason, analysis, market, log_path)
-        return False, reason, 0.0
-
     if analysis.decision.upper() == "SKIP":
         reason = "Claude returned SKIP"
         _log_rejection(reason, analysis, market, log_path)
+        return False, reason, 0.0
+
+    breakdown = compute_edge_breakdown(analysis.edge, analysis.decision, market)
+
+    if breakdown["final_edge"] < config.min_edge:
+        reason = "Insufficient edge"
+        _log_rejection(reason, analysis, market, log_path, breakdown=breakdown)
+        return False, reason, 0.0
+
+    if breakdown["kelly"] < config.min_kelly_fraction:
+        reason = "Kelly fraction below minimum"
+        _log_rejection(reason, analysis, market, log_path, breakdown=breakdown)
+        return False, reason, 0.0
+
+    if (market.volume or 0.0) < config.min_volume_24h:
+        reason = "Volume below minimum"
+        _log_rejection(reason, analysis, market, log_path, breakdown=breakdown)
         return False, reason, 0.0
 
     if portfolio.daily_pnl < -(config.daily_loss_cap_pct * portfolio.starting_balance):

@@ -8,12 +8,16 @@ import pytest
 
 from prediction_bot.dashboard import (
     _build_prelive_summary,
+    _build_rejection_rows,
     _build_replay_summary,
     _build_resolver_summary,
     _build_trade_lifecycle,
     _build_trend_chart_rows,
     _load_risk_config,
+    _polymarket_url,
     _save_kill_switch,
+    _seven_day_trends,
+    _todays_analyses,
     create_dashboard_app,
 )
 
@@ -145,6 +149,76 @@ def test_home_returns_200(dashboard_client) -> None:
     assert resp.status_code == 200
     body = resp.data.decode("utf-8")
     assert "Control Room" in body
+
+
+def test_polymarket_url_builder() -> None:
+    assert _polymarket_url("abc123") == "https://polymarket.com/event/abc123"
+    assert _polymarket_url("") == ""
+
+
+def test_todays_analyses_surfaces_reasoning_and_link() -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    analyses = [
+        {
+            "timestamp": now,
+            "market_id": "will-btc-100k",
+            "decision": "YES",
+            "confidence": "High",
+            "probability": 0.72,
+            "edge": 0.12,
+            "provider": "groq",
+            "reasoning": "Liquidity tight; CEX lag favors YES by ~3 cents.",
+        },
+    ]
+    out = _todays_analyses(analyses)
+    assert len(out) == 1
+    row = out[0]
+    assert row["polymarket_url"] == "https://polymarket.com/event/will-btc-100k"
+    assert row["decision_class"] == "green"
+    assert "CEX lag" in row["reasoning"]
+
+
+def test_build_rejection_rows_carries_edge_breakdown() -> None:
+    rows = [
+        {
+            "timestamp": "2026-04-19T08:00:00+00:00",
+            "market_id": "mkt-42",
+            "reason": "Insufficient edge",
+            "edge_breakdown": {
+                "raw_edge": 0.06,
+                "kelly": 0.12,
+                "vol_weight": 0.5,
+                "time_decay": 1.0,
+                "final_edge": 0.03,
+            },
+        },
+    ]
+    out = _build_rejection_rows(rows)
+    assert len(out) == 1
+    r = out[0]
+    assert r["polymarket_url"] == "https://polymarket.com/event/mkt-42"
+    assert r["breakdown"]["kelly"] == 0.12
+    assert r["breakdown"]["final_edge"] == 0.03
+
+
+def test_seven_day_trends_aggregates_correctly() -> None:
+    today = datetime.now(timezone.utc).date().isoformat() + "T12:00:00+00:00"
+    analyses = [
+        {"timestamp": today, "decision": "YES", "confidence": "High"},
+        {"timestamp": today, "decision": "NO", "confidence": "Medium"},
+        {"timestamp": today, "decision": "SKIP", "confidence": "Low"},
+    ]
+    out = _seven_day_trends(analyses)
+    assert len(out["rows"]) == 7
+    assert out["total_7d"] == 3
+    # Today's bucket is the last row
+    last = out["rows"][-1]
+    assert last["count"] == 3
+    assert last["buy"] == 1
+    assert last["sell"] == 1
+    assert last["skip"] == 1
+    assert last["bar_pct"] == 100
+    assert last["avg_confidence"] in {"Medium", "High", "Low"}
 
 
 def test_api_status_returns_valid_json(dashboard_client) -> None:

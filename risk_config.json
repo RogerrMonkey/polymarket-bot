@@ -6,5 +6,7 @@
   "min_confidence": "Medium",
   "kelly_fraction": 0.25,
   "min_liquidity_usdc": 10000.0,
-  "kill_switch": false
+  "kill_switch": false,
+  "min_kelly_fraction": 0.05,
+  "min_volume_24h": 5000.0
 }

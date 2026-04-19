@@ -17,6 +17,7 @@ from prediction_bot.claude_analyst import (
     StubProvider,
     build_prompt,
     build_provider_chain,
+    detect_category,
 )
 from prediction_bot.models import MarketSnapshot
 from prediction_bot.research.news_feed import NewsItem
@@ -413,3 +414,66 @@ def test_chain_falls_through_on_missing_tool_input(tmp_path: Path) -> None:
 
     result = analyst.analyze(market=_market(), news_items=[], chainlink_price=None)
     assert result.provider == "stub"
+
+
+# --------------------------------------------------------------------------- #
+# v0.8.3 — category detection + reasoning field + enriched prompt context     #
+# --------------------------------------------------------------------------- #
+
+
+def test_detect_category_matches_keywords() -> None:
+    assert detect_category("Will BTC close above 100k?") == "crypto"
+    assert detect_category("Will Trump win the 2028 election?") == "politics"
+    assert detect_category("Lakers vs Celtics NBA final winner?") == "sports"
+    assert detect_category("Will the Fed cut interest rates in June?") == "finance"
+    assert detect_category("Will it rain on Tuesday in Paris?") == "other"
+
+
+def test_build_prompt_includes_category_and_volume_tier() -> None:
+    prompt = build_prompt(_market(), [], chainlink_price=None)
+    assert "CATEGORY: crypto" in prompt
+    assert "VOLUME_24H: 20000" in prompt
+    assert "tier=medium" in prompt
+    # End-date text appears even when expires_at is None
+    assert "END_DATE:" in prompt
+
+
+def test_analysis_result_has_reasoning_field(tmp_path: Path) -> None:
+    """Reasoning field must be present and populated from the tool call."""
+
+    class _EchoProvider:
+        name = "echo"
+        model = "x"
+
+        def call(self, system_prompt: str, user_prompt: str) -> ProviderResponse:  # noqa: ARG002
+            return ProviderResponse(
+                tool_input={
+                    "probability": 0.55,
+                    "decision": "YES",
+                    "confidence": "Medium",
+                    "reasoning": "specific news catalyst outweighs base rate",
+                },
+                input_tokens=10,
+                output_tokens=5,
+                cost_usd=0.0,
+            )
+
+    analyst = ClaudeAnalyst(providers=[_EchoProvider()], log_path=tmp_path / "a.jsonl")
+    result = analyst.analyze(market=_market(), news_items=[], chainlink_price=None)
+    assert result.reasoning == "specific news catalyst outweighs base rate"
+    assert len(result.reasoning) <= 200
+
+
+def test_groq_mock_returns_reasoning_field(monkeypatch, tmp_path: Path) -> None:
+    """Confirm Groq OpenAI-compat path carries reasoning through tool arguments."""
+    _patch_imports(monkeypatch, openai_cls=_FakeOpenAIClient)
+    monkeypatch.setenv("GROQ_API_KEY", "test")
+    monkeypatch.setenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+    analyst = ClaudeAnalyst(
+        providers=[GroqProvider(api_key="test", model="llama-3.3-70b-versatile")],
+        log_path=tmp_path / "a.jsonl",
+    )
+    result = analyst.analyze(market=_market(), news_items=[], chainlink_price=None)
+    assert result.reasoning == "groq says so"
+    assert result.provider == "groq"
