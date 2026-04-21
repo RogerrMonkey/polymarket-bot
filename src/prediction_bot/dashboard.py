@@ -24,6 +24,7 @@ from prediction_bot.clients.polymarket import PolymarketClient
 from prediction_bot.config import load_config
 from prediction_bot.outcome_resolver import OutcomeResolver, read_resolution_report, write_resolution_report
 from prediction_bot.paper_metrics import check_paper_gates, daily_summary
+from prediction_bot.paper_pnl import PaperPnLTracker
 from prediction_bot.pipeline.compliance import run_preflight
 from prediction_bot.pipeline.runner import execute_scan_run
 from prediction_bot.risk_engine import RiskConfig
@@ -34,6 +35,7 @@ from prediction_bot.usdc_ops import USDCCheckReport, run_usdc_operational_checks
 
 
 PAPER_DAYS_TARGET = 14
+PAPER_DAYS_LIVE_TARGET = 30
 _PROCESS_START_TS = time.time()
 
 
@@ -301,13 +303,18 @@ def _paper_days_progress(analyses: list[dict[str, Any]]) -> dict[str, Any]:
 
     days_done = len(distinct)
     pct = _clamp_pct((days_done / PAPER_DAYS_TARGET) * 100.0 if PAPER_DAYS_TARGET else 0.0)
+    pct_live = _clamp_pct((days_done / PAPER_DAYS_LIVE_TARGET) * 100.0 if PAPER_DAYS_LIVE_TARGET else 0.0)
     days_remaining = max(0, PAPER_DAYS_TARGET - days_done)
+    days_remaining_live = max(0, PAPER_DAYS_LIVE_TARGET - days_done)
     est_completion = (datetime.now(timezone.utc).date() + timedelta(days=days_remaining)).isoformat()
     return {
         "days_done": days_done,
         "target": PAPER_DAYS_TARGET,
+        "target_live": PAPER_DAYS_LIVE_TARGET,
         "pct": pct,
+        "pct_live": pct_live,
         "days_remaining": days_remaining,
+        "days_remaining_live": days_remaining_live,
         "estimated_completion": est_completion,
         "distinct_dates": sorted(distinct),
     }
@@ -318,6 +325,68 @@ def _polymarket_url(market_id: str) -> str:
     if not mid:
         return ""
     return f"https://polymarket.com/event/{mid}"
+
+
+def _read_log_tail(workspace_root: Path, limit: int = 20) -> list[dict[str, str]]:
+    """Return the last `limit` lines of the newest log file in logs/, classified."""
+    logs_dir = workspace_root / "logs"
+    if not logs_dir.exists():
+        return []
+    try:
+        candidates = sorted(
+            (p for p in logs_dir.iterdir() if p.is_file() and p.suffix in {".log", ".jsonl", ".txt"}),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return []
+    if not candidates:
+        return []
+    newest = candidates[0]
+    try:
+        lines = newest.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    tail = lines[-limit:]
+    out: list[dict[str, str]] = []
+    for raw in tail:
+        text = raw.rstrip()
+        if not text:
+            continue
+        upper = text.upper()
+        if "ERROR" in upper or "CRITICAL" in upper or "EXCEPTION" in upper:
+            level = "error"
+        elif "WARNING" in upper or "WARN" in upper:
+            level = "warning"
+        else:
+            level = "info"
+        out.append({"line": text, "level": level})
+    return out
+
+
+def _last_analysis_run(analyses: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return {label, iso} for the most recent analysis timestamp, or an empty-state dict."""
+    latest: datetime | None = None
+    for row in analyses:
+        ts = _parse_iso(str(row.get("timestamp") or ""))
+        if ts is None:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    if latest is None:
+        return {"label": "No analyses yet", "iso": None}
+    now = datetime.now(timezone.utc)
+    delta = now - latest
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        label = "just now"
+    elif secs < 3600:
+        label = f"{secs // 60}m ago"
+    elif secs < 86400:
+        label = f"{secs // 3600}h ago"
+    else:
+        label = latest.strftime("%Y-%m-%d %H:%M UTC")
+    return {"label": label, "iso": latest.isoformat()}
 
 
 def _todays_analyses(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -724,6 +793,7 @@ DASHBOARD_HTML = """
         <span class=\"pill bad\"><span class=\"dot\"></span>LIVE MODE</span>
       {% endif %}
       <span class=\"pill\">uptime {{ status.uptime }}</span>
+      <span class=\"pill\" title=\"{{ last_run.iso or 'no analyses yet' }}\">last analysis: {{ last_run.label }}</span>
       <span class=\"spacer\"></span>
       <span class=\"pill\">checklist {{ status.checklist_pass_count }}/{{ status.checklist_total }}</span>
     </div>
@@ -739,10 +809,29 @@ DASHBOARD_HTML = """
       <!-- Panel 2: Paper Progress -->
       <div class=\"panel\">
         <div class=\"head\"><h2>Paper Progress</h2><span class=\"sub\">phase gate tracker</span></div>
-        <div class=\"kv\"><span class=\"k\">Distinct paper days</span><span class=\"v\">{{ paper_days.days_done }} / {{ paper_days.target }}</span></div>
-        <div class=\"bar-track\"><div class=\"bar-fill\" style=\"width: {{ paper_days.pct }}%\"></div></div>
-        <div class=\"kv\"><span class=\"k\">Days remaining</span><span class=\"v\">{{ paper_days.days_remaining }}</span></div>
-        <div class=\"kv\"><span class=\"k\">Estimated completion</span><span class=\"v\">{{ paper_days.estimated_completion }}</span></div>
+        <div class=\"kv\"><span class=\"k\">{{ paper_days.days_done }} / {{ paper_days.target }} days</span><span class=\"v\" style=\"color: #d4a853;\">min gate</span></div>
+        <div class=\"bar-track\"><div class=\"bar-fill\" style=\"width: {{ paper_days.pct }}%; background: #d4a853;\"></div></div>
+        <div class=\"kv\"><span class=\"k\">{{ paper_days.days_done }} / {{ paper_days.target_live }} days</span><span class=\"v\" style=\"color: #5ac37a;\">live gate</span></div>
+        <div class=\"bar-track\"><div class=\"bar-fill\" style=\"width: {{ paper_days.pct_live }}%; background: #5ac37a;\"></div></div>
+        <div class=\"kv\"><span class=\"k\">Days remaining (min)</span><span class=\"v\">{{ paper_days.days_remaining }}</span></div>
+        <div class=\"kv\"><span class=\"k\">Estimated min-gate completion</span><span class=\"v\">{{ paper_days.estimated_completion }}</span></div>
+      </div>
+
+      <!-- Panel 2b: Paper P&L -->
+      <div class=\"panel\">
+        <div class=\"head\"><h2>Paper P&amp;L</h2><span class=\"sub\">hypothetical, from resolutions</span></div>
+        {% if pnl.awaiting_resolutions %}
+          <div class=\"empty\">Awaiting resolutions — no resolved paper trades yet</div>
+        {% else %}
+          <div class=\"kv\"><span class=\"k\">Total P&amp;L</span><span class=\"v\" style=\"color: {{ 'var(--good)' if pnl.total_pnl_usdc >= 0 else 'var(--bad)' }};\">{{ '%+.2f'|format(pnl.total_pnl_usdc) }} USDC</span></div>
+          <div class=\"kv\"><span class=\"k\">Win rate</span><span class=\"v\">{{ '%.0f'|format((pnl.win_rate or 0) * 100) }}%  ({{ pnl.winning_trades }}/{{ pnl.total_trades }})</span></div>
+          <div class=\"kv\"><span class=\"k\">Avg P&amp;L / trade</span><span class=\"v\">{{ '%+.2f'|format(pnl.avg_pnl_per_trade or 0) }} USDC</span></div>
+          <div class=\"kv\"><span class=\"k\">Best trade</span><span class=\"v\" style=\"color: var(--good);\">{{ '%+.2f'|format(pnl.best_trade or 0) }} USDC</span></div>
+          <div class=\"kv\"><span class=\"k\">Worst trade</span><span class=\"v\" style=\"color: var(--bad);\">{{ '%+.2f'|format(pnl.worst_trade or 0) }} USDC</span></div>
+          {% if pnl.sharpe_approx is not none %}
+            <div class=\"kv\"><span class=\"k\">Sharpe (approx)</span><span class=\"v\">{{ pnl.sharpe_approx }}</span></div>
+          {% endif %}
+        {% endif %}
       </div>
 
       <!-- Panel 6: Performance Metrics -->
@@ -867,6 +956,18 @@ DASHBOARD_HTML = """
           </div>
         {% endfor %}
       {% endfor %}
+    </div>
+
+    <!-- Panel 8: Live Log Tail -->
+    <div class=\"panel\" style=\"margin-top: 14px;\">
+      <meta http-equiv=\"refresh\" content=\"15\" />
+      <div class=\"head\"><h2>Live Log Tail</h2><span class=\"sub\">last 20 lines · auto-refresh 15s</span></div>
+      {% if log_tail %}
+        <pre style=\"margin: 0; padding: 10px; background: #0b0d13; border-radius: 8px; max-height: 380px; overflow: auto; font-family: 'JetBrains Mono', Consolas, monospace; font-size: 12px; line-height: 1.5;\">{% for row in log_tail %}<span style=\"color: {% if row.level == 'error' %}#ef4444{% elif row.level == 'warning' %}#f5a623{% else %}#e5e7eb{% endif %};\">{{ row.line }}</span>
+{% endfor %}</pre>
+      {% else %}
+        <div class=\"empty\">no log file found in logs/</div>
+      {% endif %}
     </div>
 
     <div class=\"toolbar\">
@@ -996,6 +1097,16 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
             "top_rejections": _top_rejection_reasons(risk_all, limit=3),
         }
 
+        try:
+            pnl = PaperPnLTracker(ledger_path=workspace_root / "data" / "paper_pnl.jsonl").summary()
+        except Exception:  # noqa: BLE001
+            pnl = {
+                "total_trades": 0, "winning_trades": 0, "win_rate": None,
+                "total_pnl_usdc": 0.0, "avg_pnl_per_trade": None,
+                "best_trade": None, "worst_trade": None, "sharpe_approx": None,
+                "awaiting_resolutions": True,
+            }
+
         return {
             "status": status,
             "paper_days": _paper_days_progress(analyses_all),
@@ -1004,6 +1115,9 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
             "checklist_grouped": checklist_grouped,
             "perf": perf,
             "trends_7d": _seven_day_trends(analyses_all),
+            "pnl": pnl,
+            "log_tail": _read_log_tail(workspace_root, limit=20),
+            "last_run": _last_analysis_run(analyses_all),
         }
 
     def _legacy_state() -> dict[str, Any]:

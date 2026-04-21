@@ -190,6 +190,98 @@ class AnalysisResult:
     provider: str = "unknown"
 
 
+def _validate_and_normalise(
+    result: AnalysisResult,
+    market: MarketSnapshot,
+) -> AnalysisResult:
+    """Post-process the analyst's raw output to remove contradictory signals.
+
+    Rules (each firing logs a warning so we can tune prompts later):
+      1. BUY/SELL + Low confidence  → SKIP  (the model is guessing)
+      2. SKIP + High confidence      → demote confidence to Medium
+      3. probability > 0.98 or < 0.02 → clamp to [0.03, 0.97]
+      4. BUY but probability < market_price  → SKIP (internal contradiction)
+      5. SELL but probability > market_price → SKIP (internal contradiction)
+
+    The market price comparison uses 'yes_price' (binary market convention):
+    BUY = we think YES is undervalued, so our probability must exceed market.
+    """
+    market_id = getattr(market, "market_id", "?")
+    decision_u = (result.decision or "").upper()
+    confidence_u = (result.confidence or "").lower()
+    probability = float(result.probability)
+    market_price = market.yes_price if market.yes_price is not None else 0.5
+
+    new_decision = result.decision
+    new_confidence = result.confidence
+    new_probability = probability
+    new_reasoning = result.reasoning
+
+    # Rule 3 first so subsequent comparisons use clamped value
+    if probability > 0.98 or probability < 0.02:
+        clamped = max(0.03, min(0.97, probability))
+        logger.warning(
+            "analyst_consistency: extreme_probability {prev}→{new} market={mkt}",
+            prev=round(probability, 4), new=round(clamped, 4), mkt=market_id,
+        )
+        new_probability = clamped
+
+    # Map YES↔BUY, NO↔SELL (both conventions appear in the wild)
+    is_buy = decision_u in {"BUY", "YES"}
+    is_sell = decision_u in {"SELL", "NO"}
+
+    # Rule 1: directional + Low → SKIP
+    if (is_buy or is_sell) and confidence_u == "low":
+        logger.warning(
+            "analyst_consistency: {dec}+Low overridden to SKIP market={mkt}",
+            dec=result.decision, mkt=market_id,
+        )
+        new_decision = "SKIP"
+        is_buy = is_sell = False
+        new_reasoning = (new_reasoning + " [consistency: low_conf_directional]").strip()
+
+    # Rule 4: BUY but prob < market_price
+    if is_buy and new_probability < market_price:
+        logger.warning(
+            "analyst_consistency: BUY but prob {p}<market {m} overridden to SKIP market={mkt}",
+            p=round(new_probability, 4), m=round(market_price, 4), mkt=market_id,
+        )
+        new_decision = "SKIP"
+        is_buy = False
+        new_reasoning = (new_reasoning + " [consistency: buy_below_market]").strip()
+
+    # Rule 5: SELL but prob > market_price
+    if is_sell and new_probability > market_price:
+        logger.warning(
+            "analyst_consistency: SELL but prob {p}>market {m} overridden to SKIP market={mkt}",
+            p=round(new_probability, 4), m=round(market_price, 4), mkt=market_id,
+        )
+        new_decision = "SKIP"
+        is_sell = False
+        new_reasoning = (new_reasoning + " [consistency: sell_above_market]").strip()
+
+    # Rule 2: SKIP + High → demote to Medium (suspicious certainty without action)
+    if (new_decision or "").upper() == "SKIP" and confidence_u == "high":
+        logger.warning(
+            "analyst_consistency: SKIP+High demoted to Medium market={mkt}", mkt=market_id,
+        )
+        new_confidence = "Medium"
+
+    # Recompute edge so downstream uses post-validation probability
+    new_edge = round(abs(float(new_probability) - float(market_price)), 6)
+
+    return AnalysisResult(
+        probability=float(new_probability),
+        decision=new_decision,
+        confidence=new_confidence,
+        reasoning=new_reasoning[:200],
+        edge=new_edge,
+        cost_usd=result.cost_usd,
+        data_sources_used=list(result.data_sources_used),
+        provider=result.provider,
+    )
+
+
 @dataclass
 class ProviderResponse:
     """Normalized provider output passed back to ClaudeAnalyst."""
@@ -684,7 +776,7 @@ class ClaudeAnalyst:
             sources = [str(x) for x in sources_raw] if isinstance(sources_raw, list) else []
             edge = round(abs(probability - market_price), 6)
 
-            result = AnalysisResult(
+            raw_result = AnalysisResult(
                 probability=probability,
                 decision=decision,
                 confidence=confidence,
@@ -694,6 +786,7 @@ class ClaudeAnalyst:
                 data_sources_used=sources,
                 provider=provider.name,
             )
+            result = _validate_and_normalise(raw_result, market)
             self._log(market, result)
             return result
 

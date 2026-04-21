@@ -229,6 +229,47 @@ def _log_rejection(
         fh.write(json.dumps(entry) + "\n")
 
 
+def _emit_risk_gate_debug(
+    analysis: AnalysisResult,
+    market: MarketSnapshot,
+    breakdown: dict[str, float] | None,
+    config: RiskConfig,
+    verdict: str,
+    reason: str,
+) -> None:
+    """Single-line INFO log for every non-SKIP decision that enters the gate.
+
+    Deliberately INFO (not DEBUG) so it survives default loguru level. The
+    dashboard and operators can grep `risk_gate_debug` to see exactly why
+    directional calls are blocked without waiting for a full audit pass.
+    """
+    decision_u = (analysis.decision or "").upper()
+    if decision_u == "SKIP":
+        return
+    kelly = breakdown.get("kelly") if breakdown else None
+    vol_w = breakdown.get("vol_weight") if breakdown else None
+    td = breakdown.get("time_decay") if breakdown else None
+    final_edge = breakdown.get("final_edge") if breakdown else None
+    logger.info(
+        "risk_gate_debug market={} decision={} confidence={} probability={} "
+        "market_price={} raw_edge={} kelly={} vol_weight={} time_decay={} "
+        "final_edge={} min_kelly={} verdict={} reason={}",
+        market.market_id,
+        analysis.decision,
+        analysis.confidence,
+        analysis.probability,
+        market.yes_price,
+        analysis.edge,
+        kelly,
+        vol_w,
+        td,
+        final_edge,
+        config.min_kelly_fraction,
+        verdict,
+        reason,
+    )
+
+
 def pre_trade_check(
     analysis: AnalysisResult,
     market: MarketSnapshot,
@@ -241,6 +282,7 @@ def pre_trade_check(
     except (TypeError, ValueError):
         reason = "Invalid model probability"
         _log_rejection(reason, analysis, market, log_path)
+        _emit_risk_gate_debug(analysis, market, None, config, "REJECT", reason)
         return False, reason, 0.0
 
     analysis = AnalysisResult(
@@ -254,16 +296,19 @@ def pre_trade_check(
     if config.kill_switch:
         reason = "Kill switch active"
         _log_rejection(reason, analysis, market, log_path)
+        _emit_risk_gate_debug(analysis, market, None, config, "REJECT", reason)
         return False, reason, 0.0
 
     if _confidence_rank(analysis.confidence) < _confidence_rank(config.min_confidence):
         reason = "Confidence below threshold"
         _log_rejection(reason, analysis, market, log_path)
+        _emit_risk_gate_debug(analysis, market, None, config, "REJECT", reason)
         return False, reason, 0.0
 
     if analysis.decision.upper() == "SKIP":
         reason = "Claude returned SKIP"
         _log_rejection(reason, analysis, market, log_path)
+        # SKIP path intentionally not debug-logged (handled inside helper)
         return False, reason, 0.0
 
     breakdown = compute_edge_breakdown(analysis.edge, analysis.decision, market)
@@ -271,16 +316,19 @@ def pre_trade_check(
     if breakdown["final_edge"] < config.min_edge:
         reason = "Insufficient edge"
         _log_rejection(reason, analysis, market, log_path, breakdown=breakdown)
+        _emit_risk_gate_debug(analysis, market, breakdown, config, "REJECT", reason)
         return False, reason, 0.0
 
     if breakdown["kelly"] < config.min_kelly_fraction:
         reason = "Kelly fraction below minimum"
         _log_rejection(reason, analysis, market, log_path, breakdown=breakdown)
+        _emit_risk_gate_debug(analysis, market, breakdown, config, "REJECT", reason)
         return False, reason, 0.0
 
     if (market.volume or 0.0) < config.min_volume_24h:
         reason = "Volume below minimum"
         _log_rejection(reason, analysis, market, log_path, breakdown=breakdown)
+        _emit_risk_gate_debug(analysis, market, breakdown, config, "REJECT", reason)
         return False, reason, 0.0
 
     if portfolio.daily_pnl < -(config.daily_loss_cap_pct * portfolio.starting_balance):
@@ -330,6 +378,8 @@ def pre_trade_check(
     if approved_size < 1.0:
         reason = "Bet size below minimum"
         _log_rejection(reason, analysis, market, log_path)
+        _emit_risk_gate_debug(analysis, market, breakdown, config, "REJECT", reason)
         return False, reason, 0.0
 
+    _emit_risk_gate_debug(analysis, market, breakdown, config, "APPROVE", "APPROVED")
     return True, "APPROVED", round(approved_size, 6)

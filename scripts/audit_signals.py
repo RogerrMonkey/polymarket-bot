@@ -21,6 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ANALYSES = ROOT / "data" / "analyses.jsonl"
 RISK_LOG = ROOT / "data" / "risk_log.jsonl"
+TRADES = ROOT / "data" / "trades.jsonl"
 
 
 def _load(path: Path) -> list[dict]:
@@ -96,13 +97,25 @@ def main() -> None:
     for dec in sorted(prob_by_dec.keys()):
         print(f"  {dec:<10} avg_prob={_avg(prob_by_dec[dec])}  n={len(prob_by_dec[dec])}")
 
-    # Markets that cleared risk gate (if any)
-    accepted = [r for r in risk_rows if (r.get("outcome") == "accepted") or (r.get("status") == "accepted")]
-    print(f"\nMarkets that passed risk gate: {len(accepted)}")
-    for r in accepted[:10]:
-        mkt = r.get("market_id") or r.get("market") or "?"
-        reason = r.get("reason") or r.get("detail") or ""
-        print(f"  {mkt} {reason}")
+    # Rejection reasons (from risk_log.jsonl)
+    rej_counts = Counter(r.get("reason", "?") for r in risk_rows)
+    print(f"\nRejection reasons (from risk_log.jsonl, total {len(risk_rows)}):")
+    for reason, count in rej_counts.most_common():
+        print(f"  [{count:>4}]  {reason}")
+
+    # Trades that passed the risk gate (from trades.jsonl - authoritative)
+    trade_rows = _load(TRADES)
+    real = [r for r in trade_rows if not str(r.get("market_id", "")).startswith("syn-")]
+    synthetic = len(trade_rows) - len(real)
+    print(f"\nMarkets that passed risk gate (trades.jsonl): {len(trade_rows)}")
+    print(f"  real:      {len(real)}")
+    print(f"  synthetic: {synthetic}")
+    for r in real[:10]:
+        mkt = r.get("market_id") or "?"
+        side = r.get("side") or "?"
+        size = r.get("size_usdc") or 0.0
+        ts = (r.get("timestamp") or "")[:19]
+        print(f"  {ts}  {mkt}  {side}  ${size}")
 
     # Top 5 days by analysis count
     day_counts = Counter((r.get("timestamp") or "")[:10] for r in rows)

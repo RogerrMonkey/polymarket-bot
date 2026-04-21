@@ -97,6 +97,25 @@ class OrderExecutor:
         with self.trades_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(asdict(record)) + "\n")
 
+        # Mirror only newly-filled opening legs into the paper P&L ledger so
+        # we get clean entry rows (one per order). Cancels, failures, and
+        # status-update rewrites do not belong in the P&L tracker.
+        try:
+            if getattr(record, "status", None) == "filled" and getattr(record, "fill_size", 0) and getattr(record, "fill_price", None) is not None:
+                from prediction_bot.paper_pnl import PaperPnLTracker  # local import
+
+                PaperPnLTracker(ledger_path=self.trades_path.parent / "paper_pnl.jsonl").record_entry({
+                    "market_id": record.market_id,
+                    "side": record.side,
+                    "price": record.fill_price,
+                    "size_usdc": record.fill_size,
+                    "order_id": record.order_id,
+                    "timestamp": record.timestamp,
+                })
+        except Exception:
+            # Never let P&L bookkeeping break the order path.
+            pass
+
     def _warn_live_stub_skip(self, order_type: str, market_id: str) -> None:
         print(
             "executor_live_stub_warning="

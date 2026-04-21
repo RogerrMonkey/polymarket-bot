@@ -256,6 +256,18 @@ class OutcomeResolver:
             applied = False
             if not self.dry_run:
                 applied = store.set_outcome(prediction_id=prediction_id, outcome=float(decision.outcome))
+                # Close any matching paper-P&L entries for this market.
+                # Lazy import keeps outcome_resolver importable even if paper_pnl is stripped.
+                try:
+                    from prediction_bot.paper_pnl import PaperPnLTracker  # local import
+
+                    PaperPnLTracker().record_resolution(
+                        market_id=market_id,
+                        resolved_yes=bool(float(decision.outcome) >= 0.5),
+                    )
+                except Exception:  # noqa: BLE001
+                    # P&L tracking must never block the resolver.
+                    pass
 
             updates.append(
                 ResolutionUpdate(
