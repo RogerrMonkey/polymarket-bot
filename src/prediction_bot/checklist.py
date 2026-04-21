@@ -470,6 +470,25 @@ def _check_all_safety_checks_pass() -> ChecklistItem:
     )
 
 
+def _check_scheduler_success_rate(workspace_root: Path) -> ChecklistItem:
+    """PASS if >=80% of the last 14 scheduler_health entries were status=ok.
+
+    Gates live mode on demonstrated scheduler reliability: the system must
+    actually deliver analyses on most days before we trust it with real money.
+    """
+    name = "scheduler_success_rate_gte_80"
+    try:
+        from prediction_bot.scheduler_health import success_rate
+
+        rate, ok, total = success_rate(workspace_root, window=14)
+    except Exception as exc:  # noqa: BLE001
+        return ChecklistItem(name, False, f"error={exc}")
+    if rate is None:
+        return ChecklistItem(name, False, "no_scheduler_runs_recorded_yet")
+    passed = rate >= 0.8
+    return ChecklistItem(name, passed, f"ok={ok}/{total} rate={rate:.2f}")
+
+
 def collect_pre_live_checks(workspace_root: Path, db_path: str) -> list[ChecklistItem]:
     checks: list[ChecklistItem] = []
     checks.append(_check_dry_run_false())
@@ -483,6 +502,7 @@ def collect_pre_live_checks(workspace_root: Path, db_path: str) -> list[Checklis
     checks.append(_check_paper_loop_has_run_today(workspace_root))
     checks.append(_check_news_feed_has_sources(workspace_root))
     checks.append(_check_scheduled_job_registered())
+    checks.append(_check_scheduler_success_rate(workspace_root))
     checks.append(_check_all_safety_checks_pass())
     checks.extend(_check_access())
     return checks

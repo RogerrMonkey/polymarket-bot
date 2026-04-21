@@ -12,10 +12,15 @@ from typing import Callable
 
 from loguru import logger
 
+from prediction_bot.clients.http import HttpClient
 from prediction_bot.config import AppConfig, load_config
 from prediction_bot.executor import OrderExecutor
+from prediction_bot.outcome_resolver import OutcomeResolver, write_resolution_report
 from prediction_bot.pipeline.runner import ScanRunResult, execute_scan_run
 from prediction_bot.risk_engine import PortfolioState
+from prediction_bot.scheduler_health import record_cycle_health
+from prediction_bot.storage.prediction_store import PredictionStore
+from prediction_bot.utils.network import check_warp_active
 
 
 def _append_jsonl(path: Path, payload: dict) -> None:
@@ -93,6 +98,15 @@ def run_paper_loop(
         print("kill_switch_env_active=true paper-loop aborted before first cycle")
         return 0
 
+    # Startup WARP warning — non-fatal. The scanner may still work for some
+    # endpoints without WARP, so we log a warning and proceed rather than abort.
+    warp_active = check_warp_active()
+    if not warp_active:
+        logger.warning(
+            "WARP_INACTIVE — scanner will likely return 0 candidates. "
+            "Enable Cloudflare WARP before scheduled run time."
+        )
+
     config = load_config()
     executor = OrderExecutor(dry_run=dry_run, trades_path=workspace_root / "data" / "trades.jsonl")
     stop_requested = False
@@ -149,7 +163,44 @@ def run_paper_loop(
     if stop_requested:
         cancelled = executor.cancel_all_open_orders()
         print(f"cancelled_open_orders={cancelled}")
+        # Best-effort health-record even on interrupted runs — operators need to
+        # see that the day was disrupted, not pretend it didn't happen.
+        try:
+            record_cycle_health(workspace_root, warp_active=warp_active)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("scheduler_health_write_failed error={}", exc)
         return 130
+
+    # End-of-run outcome resolver hook. The full daily cycle is:
+    #   scan → analyse → paper trade → resolve.
+    # Resolver is stub+dry-run by default in paper mode (never crashes the loop).
+    try:
+        http = HttpClient(
+            timeout_seconds=config.runtime.request_timeout_seconds,
+            user_agent=config.runtime.user_agent,
+        )
+        resolver = OutcomeResolver(
+            workspace_root=workspace_root,
+            http=http,
+            dry_run=dry_run,  # mirror loop's dry_run: paper mode = dry_run=True
+            stub_mode=True,   # stub-map always consulted first
+        )
+        store = PredictionStore(config.storage.db_path)
+        report = resolver.settle_unresolved_predictions(store=store, limit=200)
+        write_resolution_report(workspace_root, report)
+        logger.info(
+            "paper_loop_resolver checked={} resolved={} applied={} unresolved={} errors={}",
+            report.checked, report.resolved, report.applied, report.unresolved, report.errors,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("paper_loop_resolver_failed error={}", exc)
+
+    # Record scheduler health so the dashboard and prelive-checklist can gate
+    # live-mode readiness on demonstrated reliability.
+    try:
+        record_cycle_health(workspace_root, warp_active=warp_active)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("scheduler_health_write_failed error={}", exc)
 
     return 0
 

@@ -102,6 +102,34 @@ def test_summary_mixed_winners_and_losers(tmp_path: Path) -> None:
     assert isinstance(s["sharpe_approx"], float)
 
 
+def test_summary_bankroll_trajectory(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_PAPER_BANKROLL", "100")
+    t = _tracker(tmp_path)
+    t.record_entry({"market_id": "m-1", "side": "BUY", "price": 0.40, "size_usdc": 10.0, "order_id": "a"})
+    t.record_resolution("m-1", resolved_yes=True)  # +6
+    t.record_entry({"market_id": "m-2", "side": "BUY", "price": 0.40, "size_usdc": 10.0, "order_id": "b"})
+    t.record_resolution("m-2", resolved_yes=False)  # -4
+    s = t.summary()
+    assert s["starting_bankroll"] == 100.0
+    assert abs(s["current_bankroll"] - 102.0) < 1e-4
+    assert abs(s["peak_bankroll"] - 106.0) < 1e-4
+    assert abs(s["max_drawdown"] - 4.0) < 1e-4
+    assert abs(s["roi_pct"] - 2.0) < 1e-4
+    assert len(s["bankroll_history"]) == 2
+    assert s["bankroll_history"][0]["bankroll"] == 106.0
+    assert s["bankroll_history"][1]["bankroll"] == 102.0
+
+
+def test_summary_empty_returns_bankroll_defaults(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_PAPER_BANKROLL", "250")
+    t = _tracker(tmp_path)
+    s = t.summary()
+    assert s["starting_bankroll"] == 250.0
+    assert s["current_bankroll"] == 250.0
+    assert s["bankroll_history"] == []
+    assert s["roi_pct"] == 0.0
+
+
 def test_summary_sharpe_none_when_single_trade(tmp_path: Path) -> None:
     t = _tracker(tmp_path)
     t.record_entry({"market_id": "m-1", "side": "BUY", "price": 0.40, "size_usdc": 10.0, "order_id": "a"})

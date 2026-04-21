@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -370,9 +371,16 @@ def pre_trade_check(
         _log_rejection(reason, analysis, market, log_path)
         return False, reason, 0.0
 
+    # Paper-mode sizing: honour BOT_PAPER_BANKROLL + BOT_MAX_POSITION_USDC
+    # hard caps so simulated position sizing mirrors what live mode will do.
+    paper_bankroll = float(os.getenv("BOT_PAPER_BANKROLL", "100") or "100")
+    max_position_usdc = float(os.getenv("BOT_MAX_POSITION_USDC", "10") or "10")
+    bankroll = paper_bankroll if portfolio.current_balance <= 0 else portfolio.current_balance
+
     approved_size = min(
-        kelly * config.kelly_fraction * portfolio.current_balance,
-        config.max_position_pct * portfolio.current_balance,
+        kelly * config.kelly_fraction * bankroll,
+        config.max_position_pct * bankroll,
+        max_position_usdc,  # absolute dollar cap
     )
 
     if approved_size < 1.0:
@@ -381,5 +389,12 @@ def pre_trade_check(
         _emit_risk_gate_debug(analysis, market, breakdown, config, "REJECT", reason)
         return False, reason, 0.0
 
+    logger.info(
+        "position_sized market={} kelly={:.3f} bankroll={} position_usdc={:.2f}",
+        getattr(market, "market_id", "?"),
+        float(kelly),
+        round(bankroll, 2),
+        round(float(approved_size), 2),
+    )
     _emit_risk_gate_debug(analysis, market, breakdown, config, "APPROVE", "APPROVED")
     return True, "APPROVED", round(approved_size, 6)

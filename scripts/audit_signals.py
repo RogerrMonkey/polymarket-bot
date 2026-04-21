@@ -117,6 +117,23 @@ def main() -> None:
         ts = (r.get("timestamp") or "")[:19]
         print(f"  {ts}  {mkt}  {side}  ${size}")
 
+    # Confidence rate by category (v0.8.7+)
+    # Derives category from logged `market_category`, or falls back to 'unknown'.
+    by_cat: dict[str, Counter] = defaultdict(Counter)
+    for r in rows:
+        cat = str(r.get("market_category") or "unknown")
+        conf = str(r.get("confidence") or "UNSET")
+        by_cat[cat][conf] += 1
+    print("\nConfidence rate by category:")
+    print(f"  {'category':<10}  {'n':>4}  {'Low%':>6}  {'Med%':>6}  {'High%':>6}")
+    for cat in sorted(by_cat.keys()):
+        c = by_cat[cat]
+        n = sum(c.values())
+        low_pct = (c.get("Low", 0) / n * 100.0) if n else 0.0
+        med_pct = (c.get("Medium", 0) / n * 100.0) if n else 0.0
+        high_pct = (c.get("High", 0) / n * 100.0) if n else 0.0
+        print(f"  {cat:<10}  {n:>4}  {low_pct:>5.1f}%  {med_pct:>5.1f}%  {high_pct:>5.1f}%")
+
     # Top 5 days by analysis count
     day_counts = Counter((r.get("timestamp") or "")[:10] for r in rows)
     print("\nTop 5 days by analysis count:")

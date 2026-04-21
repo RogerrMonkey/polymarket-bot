@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -150,6 +151,7 @@ class PaperPnLTracker:
         return closed
 
     def summary(self) -> dict[str, Any]:
+        starting_bankroll = float(os.getenv("BOT_PAPER_BANKROLL", "100") or "100")
         rows = [r for r in self._read() if r.get("event") == "resolution"]
         if not rows:
             return {
@@ -162,6 +164,12 @@ class PaperPnLTracker:
                 "worst_trade": None,
                 "sharpe_approx": None,
                 "awaiting_resolutions": True,
+                "starting_bankroll": starting_bankroll,
+                "current_bankroll": starting_bankroll,
+                "peak_bankroll": starting_bankroll,
+                "max_drawdown": 0.0,
+                "roi_pct": 0.0,
+                "bankroll_history": [],
             }
 
         pnls = [float(r.get("pnl_usdc", 0.0)) for r in rows]
@@ -171,6 +179,24 @@ class PaperPnLTracker:
         avg = total_pnl / n
         best = max(pnls)
         worst = min(pnls)
+
+        # Bankroll trajectory: one entry per resolution event, in chronological order.
+        bankroll = starting_bankroll
+        peak = starting_bankroll
+        max_dd = 0.0
+        history: list[dict[str, Any]] = []
+        for r in rows:
+            bankroll += float(r.get("pnl_usdc", 0.0))
+            peak = max(peak, bankroll)
+            dd = peak - bankroll
+            if dd > max_dd:
+                max_dd = dd
+            history.append({
+                "date": str(r.get("timestamp") or "")[:10],
+                "bankroll": round(bankroll, 4),
+            })
+
+        roi_pct = ((bankroll - starting_bankroll) / starting_bankroll * 100.0) if starting_bankroll > 0 else 0.0
 
         # Sharpe-approx: mean / stdev of per-trade P&L. Undefined for n<2 or zero variance.
         sharpe: float | None
@@ -192,4 +218,10 @@ class PaperPnLTracker:
             "worst_trade": round(worst, 4),
             "sharpe_approx": sharpe,
             "awaiting_resolutions": False,
+            "starting_bankroll": round(starting_bankroll, 4),
+            "current_bankroll": round(bankroll, 4),
+            "peak_bankroll": round(peak, 4),
+            "max_drawdown": round(max_dd, 4),
+            "roi_pct": round(roi_pct, 4),
+            "bankroll_history": history,
         }

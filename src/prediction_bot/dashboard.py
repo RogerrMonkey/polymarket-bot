@@ -22,9 +22,15 @@ from prediction_bot.checklist import (
 from prediction_bot.clients.http import HttpClient
 from prediction_bot.clients.polymarket import PolymarketClient
 from prediction_bot.config import load_config
-from prediction_bot.outcome_resolver import OutcomeResolver, read_resolution_report, write_resolution_report
+from prediction_bot.outcome_resolver import (
+    OutcomeResolver,
+    _read_resolved_market_ids,
+    read_resolution_report,
+    write_resolution_report,
+)
 from prediction_bot.paper_metrics import check_paper_gates, daily_summary
 from prediction_bot.paper_pnl import PaperPnLTracker
+from prediction_bot.scheduler_health import read_scheduler_health, success_rate
 from prediction_bot.pipeline.compliance import run_preflight
 from prediction_bot.pipeline.runner import execute_scan_run
 from prediction_bot.risk_engine import RiskConfig
@@ -259,12 +265,13 @@ def _build_resolver_summary(report: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _warp_status(host: str = "gamma-api.polymarket.com") -> dict[str, Any]:
-    """Quick DNS probe to the Polymarket Gamma host; WARP routes it when DNS is blocked."""
-    try:
-        socket.gethostbyname(host)
+    """Quick DNS probe via the shared helper so dashboard + scheduler agree."""
+    from prediction_bot.utils.network import check_warp_active
+
+    ok = check_warp_active(host=host, timeout_seconds=3.0)
+    if ok:
         return {"ok": True, "label": "WARP ON", "host": host}
-    except OSError as exc:
-        return {"ok": False, "label": "WARP OFF", "host": host, "error": str(exc)}
+    return {"ok": False, "label": "WARP OFF", "host": host, "error": "dns_resolve_failed"}
 
 
 def _resolve_provider_and_model() -> dict[str, str]:
@@ -815,6 +822,7 @@ DASHBOARD_HTML = """
         <div class=\"bar-track\"><div class=\"bar-fill\" style=\"width: {{ paper_days.pct_live }}%; background: #5ac37a;\"></div></div>
         <div class=\"kv\"><span class=\"k\">Days remaining (min)</span><span class=\"v\">{{ paper_days.days_remaining }}</span></div>
         <div class=\"kv\"><span class=\"k\">Estimated min-gate completion</span><span class=\"v\">{{ paper_days.estimated_completion }}</span></div>
+        <div class=\"kv\"><span class=\"k\">Resolved markets</span><span class=\"v\">{{ resolver_counts.resolved }} | Pending resolution: {{ resolver_counts.pending }}</span></div>
       </div>
 
       <!-- Panel 2b: Paper P&L -->
@@ -830,6 +838,18 @@ DASHBOARD_HTML = """
           <div class=\"kv\"><span class=\"k\">Worst trade</span><span class=\"v\" style=\"color: var(--bad);\">{{ '%+.2f'|format(pnl.worst_trade or 0) }} USDC</span></div>
           {% if pnl.sharpe_approx is not none %}
             <div class=\"kv\"><span class=\"k\">Sharpe (approx)</span><span class=\"v\">{{ pnl.sharpe_approx }}</span></div>
+          {% endif %}
+          <div class=\"kv\"><span class=\"k\">Bankroll</span><span class=\"v\">${{ '%.2f'|format(pnl.starting_bankroll) }} → ${{ '%.2f'|format(pnl.current_bankroll) }} (ROI: <span style=\"color: {{ 'var(--good)' if pnl.roi_pct >= 0 else 'var(--bad)' }};\">{{ '%+.1f'|format(pnl.roi_pct) }}%</span>)</span></div>
+          <div class=\"kv\"><span class=\"k\">Peak / Max DD</span><span class=\"v\">${{ '%.2f'|format(pnl.peak_bankroll) }} / ${{ '%.2f'|format(pnl.max_drawdown) }}</span></div>
+          {% if pnl.bankroll_history and pnl.bankroll_history|length >= 2 %}
+            <div style=\"margin-top:8px; display:flex; align-items:flex-end; gap:2px; height:48px; background:#0b0d13; border-radius:6px; padding:6px;\">
+              {% set maxb = pnl.peak_bankroll if pnl.peak_bankroll > 0 else 1 %}
+              {% for point in pnl.bankroll_history %}
+                <span title=\"{{ point.date }}: ${{ '%.2f'|format(point.bankroll) }}\" style=\"flex:1; background:{{ '#5ac37a' if point.bankroll >= pnl.starting_bankroll else '#ef4444' }}; height:{{ (point.bankroll / maxb * 100)|int }}%; min-height:2px;\"></span>
+              {% endfor %}
+            </div>
+          {% else %}
+            <div class=\"empty\" style=\"margin-top:8px;\">Awaiting trade resolutions for chart</div>
           {% endif %}
         {% endif %}
       </div>
@@ -956,6 +976,30 @@ DASHBOARD_HTML = """
           </div>
         {% endfor %}
       {% endfor %}
+    </div>
+
+    <!-- Panel 9: Scheduler Health -->
+    <div class=\"panel\" style=\"margin-top: 14px;\">
+      <div class=\"head\">
+        <h2>Scheduler Health</h2>
+        <span class=\"sub\">last 7 runs · success rate (14d): {% if scheduler_success[0] is none %}—{% else %}{{ '%.0f'|format(scheduler_success[0] * 100) }}% ({{ scheduler_success[1] }}/{{ scheduler_success[2] }}){% endif %}</span>
+      </div>
+      {% if scheduler_health %}
+        <table class=\"rej-table\">
+          <tr><th>Date</th><th>Status</th><th>WARP</th><th>Analyses</th><th>Reason</th></tr>
+          {% for h in scheduler_health %}
+            <tr>
+              <td>{{ h.date }}</td>
+              <td><span style=\"color: {% if h.status == 'ok' %}var(--good){% else %}var(--bad){% endif %};\">{{ h.status|upper }}</span></td>
+              <td>{% if h.warp_active %}ON{% else %}OFF{% endif %}</td>
+              <td class=\"count\">{{ h.analyses_today }}</td>
+              <td>{{ h.reason }}</td>
+            </tr>
+          {% endfor %}
+        </table>
+      {% else %}
+        <div class=\"empty\">No scheduler runs recorded yet</div>
+      {% endif %}
     </div>
 
     <!-- Panel 8: Live Log Tail -->
@@ -1097,6 +1141,20 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
             "top_rejections": _top_rejection_reasons(risk_all, limit=3),
         }
 
+        # Resolver status — surfaced in the Paper Progress panel.
+        try:
+            resolved_ids = _read_resolved_market_ids(workspace_root)
+            trades_all = _read_jsonl_all(workspace_root / "data" / "trades.jsonl")
+            # Unique market_ids in trades that haven't been resolved yet.
+            traded_ids = {str(r.get("market_id")) for r in trades_all if r.get("market_id")}
+            pending_resolution = max(0, len(traded_ids - resolved_ids))
+            resolver_counts = {
+                "resolved": len(resolved_ids),
+                "pending": pending_resolution,
+            }
+        except Exception:  # noqa: BLE001
+            resolver_counts = {"resolved": 0, "pending": 0}
+
         try:
             pnl = PaperPnLTracker(ledger_path=workspace_root / "data" / "paper_pnl.jsonl").summary()
         except Exception:  # noqa: BLE001
@@ -1118,6 +1176,9 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
             "pnl": pnl,
             "log_tail": _read_log_tail(workspace_root, limit=20),
             "last_run": _last_analysis_run(analyses_all),
+            "resolver_counts": resolver_counts,
+            "scheduler_health": read_scheduler_health(workspace_root, limit=7),
+            "scheduler_success": success_rate(workspace_root, window=14),
         }
 
     def _legacy_state() -> dict[str, Any]:

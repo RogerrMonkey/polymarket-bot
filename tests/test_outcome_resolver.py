@@ -74,6 +74,128 @@ def test_outcome_resolver_stub_apply(tmp_path: Path) -> None:
     assert pred_id not in unresolved_ids
 
 
+def test_resolver_skips_already_resolved_markets(tmp_path: Path) -> None:
+    db_path = str(tmp_path / "predictions.db")
+    store = PredictionStore(db_path)
+    _seed_prediction(store, "m-dupe")
+
+    # Pre-seed the resolved_markets.jsonl with this id so the resolver skips it.
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data" / "resolved_markets.jsonl").write_text(
+        json.dumps({"market_id": "m-dupe", "resolved_yes": True}) + "\n",
+        encoding="utf-8",
+    )
+
+    stub_path = tmp_path / "data" / "resolution_stub.json"
+    stub_path.write_text(json.dumps({"m-dupe": 1}), encoding="utf-8")
+
+    resolver = OutcomeResolver(
+        workspace_root=tmp_path,
+        http=None,
+        dry_run=False,
+        stub_mode=True,
+        stub_path=stub_path,
+    )
+    report = resolver.settle_unresolved_predictions(store=store, limit=20)
+    # No new updates — the row was skipped on the skip-list.
+    assert report.resolved == 0
+    assert report.applied == 0
+
+
+def test_resolver_writes_resolved_markets_jsonl_on_apply(tmp_path: Path) -> None:
+    db_path = str(tmp_path / "predictions.db")
+    store = PredictionStore(db_path)
+    _seed_prediction(store, "m-writeout")
+
+    # Seed a trade entry so entry_price + pnl_usdc flow into the row.
+    trades_path = tmp_path / "data" / "trades.jsonl"
+    trades_path.parent.mkdir(parents=True, exist_ok=True)
+    trades_path.write_text(
+        json.dumps({
+            "market_id": "m-writeout", "side": "BUY",
+            "fill_price": 0.4, "fill_size": 10.0,
+            "order_id": "ord-1", "status": "filled", "timestamp": "2026-04-21T00:00:00Z",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    stub_path = tmp_path / "data" / "resolution_stub.json"
+    stub_path.write_text(json.dumps({"m-writeout": 1}), encoding="utf-8")
+
+    resolver = OutcomeResolver(
+        workspace_root=tmp_path,
+        http=None,
+        dry_run=False,
+        stub_mode=True,
+        stub_path=stub_path,
+    )
+    report = resolver.settle_unresolved_predictions(store=store, limit=20)
+    assert report.applied == 1
+
+    written = (tmp_path / "data" / "resolved_markets.jsonl").read_text(encoding="utf-8").strip()
+    row = json.loads(written.splitlines()[-1])
+    assert row["market_id"] == "m-writeout"
+    assert row["resolved_yes"] is True
+    assert row["entry_price"] == 0.4
+    # BUY @ 0.4 * 10 resolved YES → +6.0
+    assert abs(row["pnl_usdc"] - 6.0) < 1e-9
+    assert "resolution_timestamp" in row
+
+
+def test_resolver_gamma_failure_is_logged_and_continues(tmp_path: Path) -> None:
+    db_path = str(tmp_path / "predictions.db")
+    store = PredictionStore(db_path)
+    _seed_prediction(store, "m-gamma-fail")
+
+    # No stub entry, no http → http==None means _market_payload returns None
+    # for every market.  Resolver must NOT crash; it must return a clean report.
+    resolver = OutcomeResolver(
+        workspace_root=tmp_path,
+        http=None,
+        dry_run=False,
+        stub_mode=False,
+    )
+    report = resolver.settle_unresolved_predictions(store=store, limit=5)
+    assert report.checked == 1
+    assert report.resolved == 0
+    assert report.errors == 0  # payload None is an unresolved case, not an error
+
+
+def test_resolver_calls_pnl_tracker_on_resolution(tmp_path: Path) -> None:
+    db_path = str(tmp_path / "predictions.db")
+    store = PredictionStore(db_path)
+    _seed_prediction(store, "m-pnl-hook")
+
+    # Seed an entry in paper_pnl so the resolver's record_resolution finds it.
+    from prediction_bot.paper_pnl import PaperPnLTracker
+
+    tracker = PaperPnLTracker(ledger_path=tmp_path / "data" / "paper_pnl.jsonl")
+    tracker.record_entry({
+        "market_id": "m-pnl-hook", "side": "BUY",
+        "price": 0.4, "size_usdc": 10.0, "order_id": "ord-x",
+    })
+
+    stub_path = tmp_path / "data" / "resolution_stub.json"
+    stub_path.parent.mkdir(parents=True, exist_ok=True)
+    stub_path.write_text(json.dumps({"m-pnl-hook": 1}), encoding="utf-8")
+
+    resolver = OutcomeResolver(
+        workspace_root=tmp_path,
+        http=None,
+        dry_run=False,
+        stub_mode=True,
+        stub_path=stub_path,
+    )
+    resolver.settle_unresolved_predictions(store=store, limit=5)
+
+    # Expect a resolution row in paper_pnl.jsonl with the computed P&L.
+    ledger = (tmp_path / "data" / "paper_pnl.jsonl").read_text(encoding="utf-8").splitlines()
+    resolutions = [json.loads(line) for line in ledger if '"resolution"' in line]
+    assert len(resolutions) == 1
+    assert resolutions[0]["market_id"] == "m-pnl-hook"
+    assert abs(resolutions[0]["pnl_usdc"] - 6.0) < 1e-9
+
+
 def test_outcome_resolver_closed_not_settled_is_unresolved(tmp_path: Path) -> None:
     resolver = OutcomeResolver(
         workspace_root=tmp_path,
