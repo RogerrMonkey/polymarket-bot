@@ -515,6 +515,7 @@ _CHECK_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "env_polymarket_private_key_present",
             "env_polymarket_funder_address_present",
             "env_signature_type_present",
+            "wallet_address_valid",
             "balance_usdc_gt_20",
             "open_orders_empty",
         ),
@@ -522,6 +523,7 @@ _CHECK_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "Safety",
         (
+            "all_safety_checks_pass",
             "env_dry_run_false",
             "risk_kill_switch_false",
             "risk_daily_loss_cap_range",

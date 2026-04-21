@@ -159,7 +159,7 @@ def _extract_numeric(value: Any) -> float | None:
 
 def _check_balance_and_open_orders() -> list[ChecklistItem]:
     try:
-        from prediction_bot.auth import get_client
+        from prediction_bot.auth import _call_balance, _call_open_orders, get_client
     except Exception as exc:  # noqa: BLE001
         return [
             ChecklistItem("balance_usdc_gt_20", False, f"auth_import_failed:{exc}"),
@@ -168,8 +168,8 @@ def _check_balance_and_open_orders() -> list[ChecklistItem]:
 
     try:
         client = get_client()
-        balance_payload = client.get_balance()
-        open_orders = client.get_open_orders()
+        balance_payload = _call_balance(client)
+        open_orders = _call_open_orders(client)
     except Exception as exc:  # noqa: BLE001
         return [
             ChecklistItem("balance_usdc_gt_20", False, f"auth_call_failed:{exc}"),
@@ -408,11 +408,74 @@ def _check_access() -> list[ChecklistItem]:
     ]
 
 
+def _check_wallet_address_valid() -> ChecklistItem:
+    """Cheap, offline EIP-55 validation for POLYGON_WALLET_ADDRESS.
+
+    We deliberately avoid an RPC round-trip so this check stays fast and
+    actionable even when the node is temporarily unreachable.
+    """
+    raw = (os.getenv("POLYGON_WALLET_ADDRESS") or "").strip()
+    if not raw:
+        return ChecklistItem("wallet_address_valid", False, "missing POLYGON_WALLET_ADDRESS")
+    try:
+        from web3 import Web3  # type: ignore
+
+        checksummed = Web3.to_checksum_address(raw)
+    except Exception as exc:  # noqa: BLE001
+        return ChecklistItem("wallet_address_valid", False, f"invalid:{exc}")
+    # If the raw form already matches the checksum form, the user stored it correctly.
+    status = "checksum_match" if raw == checksummed else f"normalized_to:{checksummed}"
+    return ChecklistItem("wallet_address_valid", True, status)
+
+
+def _check_all_safety_checks_pass() -> ChecklistItem:
+    """Meta-check: single red/green indicator for core safety gates.
+
+    Passes only when every one of these holds:
+      - risk_config.json `kill_switch` is false (authoritative; evaluated
+        per-order in risk_engine) AND env KILL_SWITCH is not true
+      - BOT_LIVE_MODE=false (or unset)
+      - DRY_RUN=true
+    """
+    reasons: list[str] = []
+
+    # Env-level kill switch (advisory)
+    kill_switch_env = _parse_bool(os.getenv("KILL_SWITCH"))
+    if kill_switch_env is True:
+        reasons.append("kill_switch_env_active")
+
+    # File-level kill switch (authoritative — risk_engine reads this)
+    try:
+        cfg_path = Path("risk_config.json")
+        if cfg_path.exists():
+            cfg_kill = bool(json.loads(cfg_path.read_text(encoding="utf-8")).get("kill_switch", False))
+            if cfg_kill:
+                reasons.append("kill_switch_config_active")
+    except Exception:
+        # Silent: the risk_kill_switch_false check already reports config load errors.
+        pass
+
+    live_mode = _parse_bool(os.getenv("BOT_LIVE_MODE"))
+    if live_mode is True:
+        reasons.append("live_mode_true")
+    dry_run = _parse_bool(os.getenv("DRY_RUN"))
+    if dry_run is False:
+        reasons.append("dry_run_false")
+    if reasons:
+        return ChecklistItem("all_safety_checks_pass", False, "|".join(reasons))
+    return ChecklistItem(
+        "all_safety_checks_pass",
+        True,
+        "kill_switch_inactive, live_mode_false, dry_run_true",
+    )
+
+
 def collect_pre_live_checks(workspace_root: Path, db_path: str) -> list[ChecklistItem]:
     checks: list[ChecklistItem] = []
     checks.append(_check_dry_run_false())
     checks.append(_check_polygon_rpc())
     checks.extend(_check_polymarket_envs())
+    checks.append(_check_wallet_address_valid())
     checks.append(_check_analyst_provider_resolved())
     checks.extend(_check_balance_and_open_orders())
     checks.extend(_check_risk_config(workspace_root))
@@ -420,6 +483,7 @@ def collect_pre_live_checks(workspace_root: Path, db_path: str) -> list[Checklis
     checks.append(_check_paper_loop_has_run_today(workspace_root))
     checks.append(_check_news_feed_has_sources(workspace_root))
     checks.append(_check_scheduled_job_registered())
+    checks.append(_check_all_safety_checks_pass())
     checks.extend(_check_access())
     return checks
 

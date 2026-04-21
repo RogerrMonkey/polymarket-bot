@@ -67,7 +67,9 @@ def load_auth_settings() -> AuthSettings:
 
     private_key = _normalize_private_key(_required_env("POLYMARKET_PRIVATE_KEY"))
     funder_address = _normalize_funder_address(_required_env("POLYMARKET_FUNDER_ADDRESS"))
-    anthropic_api_key = _required_env("ANTHROPIC_API_KEY")
+    # ANTHROPIC_API_KEY is optional here — Polymarket wallet auth does not need it.
+    # Analyst provider (groq/anthropic/ollama) is resolved independently in claude_analyst.py.
+    anthropic_api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
 
     signature_raw = os.getenv("SIGNATURE_TYPE", "1").strip()
     try:
@@ -135,11 +137,39 @@ def _extract_balance_usdc(balance_payload: Any) -> str:
     return str(balance_payload)
 
 
+def _call_balance(client: Any) -> Any:
+    """Version-tolerant USDC balance read for py-clob-client.
+
+    Modern versions (>=0.17) expose get_balance_allowance(BalanceAllowanceParams(asset_type=COLLATERAL));
+    older forks had a plain get_balance(). Try both.
+    """
+    if hasattr(client, "get_balance"):
+        return client.get_balance()
+    if hasattr(client, "get_balance_allowance"):
+        try:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams  # type: ignore
+
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            return client.get_balance_allowance(params)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"get_balance_allowance failed: {exc}") from exc
+    raise RuntimeError("ClobClient has neither get_balance nor get_balance_allowance")
+
+
+def _call_open_orders(client: Any) -> Any:
+    """Version-tolerant open-orders read."""
+    if hasattr(client, "get_open_orders"):
+        return client.get_open_orders()
+    if hasattr(client, "get_orders"):
+        return client.get_orders()
+    raise RuntimeError("ClobClient has neither get_open_orders nor get_orders")
+
+
 def verify_auth() -> bool:
     try:
         c = get_client()
-        balance = c.get_balance()
-        orders = c.get_open_orders()
+        balance = _call_balance(c)
+        orders = _call_open_orders(c)
 
         order_count = len(orders) if hasattr(orders, "__len__") else 0
         print(f"usdc_balance={_extract_balance_usdc(balance)}")

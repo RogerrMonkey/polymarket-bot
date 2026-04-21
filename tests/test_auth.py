@@ -28,6 +28,8 @@ class _FakeClobClient:
 
 
 def test_load_auth_settings_requires_values(monkeypatch):
+    # Neuter dotenv so it cannot re-populate vars from the developer's real .env
+    monkeypatch.setattr(auth, "_load_dotenv_if_available", lambda: None)
     monkeypatch.delenv("POLYMARKET_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("POLYMARKET_FUNDER_ADDRESS", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)

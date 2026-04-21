@@ -110,3 +110,26 @@ def test_run_paper_loop_signal_shutdown_calls_cancel(monkeypatch, tmp_path: Path
 
     assert code == 130
     assert executor_holder["ex"].cancelled is True
+
+
+def test_run_paper_loop_aborts_on_env_kill_switch(monkeypatch, tmp_path: Path, capsys) -> None:
+    # Should never reach the executor/config path when KILL_SWITCH env is true.
+    monkeypatch.setenv("KILL_SWITCH", "true")
+
+    def _should_not_run(*a, **kw):  # noqa: ANN002, ANN003
+        raise AssertionError("run_cycle was invoked despite KILL_SWITCH=true")
+
+    monkeypatch.setattr(ml, "_run_cycle", _should_not_run)
+
+    code = ml.run_paper_loop(
+        cycles=1,
+        interval_seconds=0,
+        limit_per_venue=1,
+        top_n_for_risk=1,
+        workspace_root=tmp_path,
+        dry_run=True,
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "kill_switch_env_active=true" in out

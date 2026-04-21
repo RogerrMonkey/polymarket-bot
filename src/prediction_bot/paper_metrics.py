@@ -222,10 +222,18 @@ def print_scorecard(workspace_root: Path, db_path: str) -> dict[str, Any]:
         "estimated_pnl",
         "actual_pnl",
         "api_cost_usd",
-        "brier_score",
         "risk_cap_hits",
     ]:
         print(f"{key}={summary[key]}")
+
+    # Brier score is lifetime across ALL resolved predictions (not today-scoped).
+    # Surface sample_count so the operator can tell synthetic replay from real resolutions.
+    store = PredictionStore(db_path)
+    bm = store.brier_metrics()
+    if bm.brier_score is None or bm.sample_count == 0:
+        print("brier_score=unavailable (no resolved markets yet)")
+    else:
+        print(f"brier_score={bm.brier_score} (sample_count={bm.sample_count}, rmse={bm.rmse})")
 
     print("rejection_reasons:")
     reasons = summary.get("rejection_reasons", {})

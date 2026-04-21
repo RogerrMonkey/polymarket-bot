@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import signal
 import time
 from dataclasses import asdict
@@ -84,6 +85,14 @@ def run_paper_loop(
     workspace_root: Path,
     dry_run: bool,
 ) -> int:
+    # Env-level KILL_SWITCH is an operator panic button: abort before we even
+    # spin up the executor so no side effects (order placement, cost, logs) occur.
+    # File-level kill_switch in risk_config.json is enforced per-order in risk_engine.
+    kill_env = (os.getenv("KILL_SWITCH") or "").strip().lower()
+    if kill_env in {"1", "true", "yes", "on"}:
+        print("kill_switch_env_active=true paper-loop aborted before first cycle")
+        return 0
+
     config = load_config()
     executor = OrderExecutor(dry_run=dry_run, trades_path=workspace_root / "data" / "trades.jsonl")
     stop_requested = False

@@ -39,12 +39,74 @@ def test_collect_pre_live_checks_aggregates(monkeypatch, tmp_path: Path) -> None
         "_check_scheduled_job_registered",
         lambda: checklist.ChecklistItem("scheduled_job_registered", True, "ok"),
     )
+    monkeypatch.setattr(
+        checklist,
+        "_check_wallet_address_valid",
+        lambda: checklist.ChecklistItem("wallet_address_valid", True, "ok"),
+    )
+    monkeypatch.setattr(
+        checklist,
+        "_check_all_safety_checks_pass",
+        lambda: checklist.ChecklistItem("all_safety_checks_pass", True, "ok"),
+    )
     monkeypatch.setattr(checklist, "_check_access", lambda: [checklist.ChecklistItem("access", True, "ok")])
 
     ready, items = checklist.run_pre_live_checklist(workspace_root=tmp_path, db_path=str(tmp_path / "db.sqlite"))
 
     assert ready is True
-    assert len(items) == 12
+    assert len(items) == 14
+
+
+def test_check_wallet_address_valid_missing(monkeypatch) -> None:
+    monkeypatch.delenv("POLYGON_WALLET_ADDRESS", raising=False)
+    item = checklist._check_wallet_address_valid()
+    assert item.passed is False
+    assert "missing" in item.detail
+
+
+def test_check_wallet_address_valid_checksums_lowercase(monkeypatch) -> None:
+    # Lowercase valid address → normalized to EIP-55 mixed case, still PASS
+    monkeypatch.setenv(
+        "POLYGON_WALLET_ADDRESS",
+        "0x8ba1f109551bd432803012645ac136ddd64dba72",
+    )
+    item = checklist._check_wallet_address_valid()
+    assert item.passed is True
+    assert "normalized_to:" in item.detail or "checksum_match" in item.detail
+
+
+def test_check_wallet_address_valid_rejects_garbage(monkeypatch) -> None:
+    monkeypatch.setenv("POLYGON_WALLET_ADDRESS", "not-an-address")
+    item = checklist._check_wallet_address_valid()
+    assert item.passed is False
+    assert "invalid" in item.detail
+
+
+def test_check_all_safety_checks_pass_happy(monkeypatch) -> None:
+    monkeypatch.delenv("KILL_SWITCH", raising=False)
+    monkeypatch.setenv("BOT_LIVE_MODE", "false")
+    monkeypatch.setenv("DRY_RUN", "true")
+    item = checklist._check_all_safety_checks_pass()
+    assert item.passed is True
+    assert "live_mode_false" in item.detail
+
+
+def test_check_all_safety_checks_pass_fails_on_live_mode(monkeypatch) -> None:
+    monkeypatch.setenv("BOT_LIVE_MODE", "true")
+    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.delenv("KILL_SWITCH", raising=False)
+    item = checklist._check_all_safety_checks_pass()
+    assert item.passed is False
+    assert "live_mode_true" in item.detail
+
+
+def test_check_all_safety_checks_pass_fails_on_kill_switch(monkeypatch) -> None:
+    monkeypatch.setenv("KILL_SWITCH", "true")
+    monkeypatch.setenv("BOT_LIVE_MODE", "false")
+    monkeypatch.setenv("DRY_RUN", "true")
+    item = checklist._check_all_safety_checks_pass()
+    assert item.passed is False
+    assert "kill_switch_env_active" in item.detail
 
 
 def test_run_pre_live_checklist_fails_on_any_check(monkeypatch, tmp_path: Path) -> None:
