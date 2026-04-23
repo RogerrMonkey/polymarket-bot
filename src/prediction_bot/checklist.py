@@ -470,6 +470,38 @@ def _check_all_safety_checks_pass() -> ChecklistItem:
     )
 
 
+def _check_warp_cli_installed() -> ChecklistItem:
+    """PASS if `warp-cli --version` exits 0.
+
+    Cloudflare WARP is the DNS bypass we rely on to reach Polymarket from
+    India. If the CLI is not installed, the scheduler cannot auto-connect
+    before the 03:00 UTC run. Skip PASS on non-Windows (warp-cli not
+    required there).
+    """
+    import platform
+    import subprocess
+
+    name = "warp_cli_installed"
+    if platform.system() != "Windows":
+        return ChecklistItem(name, True, "non_windows_skip")
+    try:
+        result = subprocess.run(
+            ["warp-cli", "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except FileNotFoundError:
+        return ChecklistItem(
+            name, False,
+            "warp-cli not found — install WARP CLI from https://1.1.1.1",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return ChecklistItem(name, False, f"warp_cli_probe_error:{exc}")
+    if result.returncode != 0:
+        return ChecklistItem(name, False, f"warp-cli_exit={result.returncode}")
+    version = (result.stdout or result.stderr or "").strip().splitlines()
+    return ChecklistItem(name, True, f"version={version[0] if version else 'present'}")
+
+
 def _check_scheduler_success_rate(workspace_root: Path) -> ChecklistItem:
     """PASS if >=80% of the last 14 scheduler_health entries were status=ok.
 
@@ -502,6 +534,7 @@ def collect_pre_live_checks(workspace_root: Path, db_path: str) -> list[Checklis
     checks.append(_check_paper_loop_has_run_today(workspace_root))
     checks.append(_check_news_feed_has_sources(workspace_root))
     checks.append(_check_scheduled_job_registered())
+    checks.append(_check_warp_cli_installed())
     checks.append(_check_scheduler_success_rate(workspace_root))
     checks.append(_check_all_safety_checks_pass())
     checks.extend(_check_access())

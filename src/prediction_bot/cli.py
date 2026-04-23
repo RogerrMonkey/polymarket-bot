@@ -9,6 +9,8 @@ from prediction_bot.clients.http import HttpClient
 from prediction_bot.clients.polymarket import PolymarketClient
 from prediction_bot.config import load_config
 from prediction_bot.dashboard import run_dashboard
+from prediction_bot.health_check import run_health_check_command
+from prediction_bot.live_readiness import run_live_readiness_command
 from prediction_bot.main_loop import run_paper_loop, run_paper_loop_scheduled
 from prediction_bot.outcome_resolver import OutcomeResolver, print_resolution_report, write_resolution_report
 from prediction_bot.paper_metrics import check_paper_gates, print_scorecard
@@ -479,6 +481,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("preflight", help="Run Gate Zero geo/access check")
     sub.add_parser("verify-auth", help="Run authenticated CLOB credential checks")
+    sub.add_parser("health-check", help="Print a one-page system health snapshot")
+    sub.add_parser("live-readiness", help="Evaluate live-mode readiness gates")
 
     news = sub.add_parser("news-check", help="Smoke test the news pipeline; print top headlines")
     news.add_argument("--limit", type=int, default=3)
@@ -543,6 +547,18 @@ def main() -> int:
         return run_verify_auth_command()
     if args.command == "news-check":
         return run_news_check_command(limit=args.limit)
+    if args.command == "health-check":
+        config = load_config()
+        return run_health_check_command(
+            workspace_root=Path(".").resolve(),
+            db_path=config.storage.db_path,
+        )
+    if args.command == "live-readiness":
+        config = load_config()
+        return run_live_readiness_command(
+            workspace_root=Path(".").resolve(),
+            db_path=config.storage.db_path,
+        )
 
     parser.error("Unknown command")
     return 2

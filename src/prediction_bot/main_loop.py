@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -27,6 +28,105 @@ def _append_jsonl(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload) + "\n")
+
+
+def _run_lock_path(workspace_root: Path) -> Path:
+    return workspace_root / "data" / "run.lock"
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Return True if a process with the given PID is currently running."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return str(pid) in (out.stdout or "")
+        except Exception:  # noqa: BLE001
+            # If we can't check, assume alive so we don't steal a lock from a live process.
+            return True
+    # POSIX
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _acquire_run_lock(workspace_root: Path, *, cycles_planned: int) -> bool:
+    """Write data/run.lock with current pid/start/cycles.
+
+    If a stale lock file references a dead PID, log WARNING, emit a
+    scheduler_health row with status='crashed' for that previous date,
+    then overwrite the lock and proceed. Returns True on success.
+    """
+    lock = _run_lock_path(workspace_root)
+    if lock.exists():
+        try:
+            prev = json.loads(lock.read_text(encoding="utf-8"))
+            prev_pid = int(prev.get("pid", 0) or 0)
+        except Exception:  # noqa: BLE001
+            prev_pid = 0
+        if prev_pid and _pid_is_alive(prev_pid):
+            logger.error("run_lock_conflict another_run_active pid={}", prev_pid)
+            return False
+        logger.warning(
+            "run_lock_stale previous run may have crashed pid={} — recording crash and continuing",
+            prev_pid,
+        )
+        try:
+            record_cycle_health(
+                workspace_root,
+                status_override="crashed",
+                reason_override=f"stale_lock_recovered pid={prev_pid}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("scheduler_health_crash_record_failed error={}", exc)
+
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": os.getpid(),
+        "started_at": _utc_now_iso(),
+        "cycles_planned": int(cycles_planned),
+    }
+    lock.write_text(json.dumps(payload), encoding="utf-8")
+    return True
+
+
+def _release_run_lock(workspace_root: Path) -> None:
+    lock = _run_lock_path(workspace_root)
+    try:
+        if lock.exists():
+            lock.unlink()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("run_lock_release_failed error={}", exc)
+
+
+def _append_heartbeat(workspace_root: Path, *, cycle: int, analyses_so_far: int) -> None:
+    """Emit a per-cycle heartbeat row into scheduler_health.jsonl."""
+    from prediction_bot.scheduler_health import scheduler_health_path
+
+    path = scheduler_health_path(workspace_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "type": "heartbeat",
+        "cycle": int(cycle),
+        "analyses_so_far": int(analyses_so_far),
+        "timestamp": _utc_now_iso(),
+    }
+    try:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("heartbeat_write_failed error={}", exc)
 
 
 def _utc_now_iso() -> str:
@@ -98,18 +198,49 @@ def run_paper_loop(
         print("kill_switch_env_active=true paper-loop aborted before first cycle")
         return 0
 
-    # Startup WARP warning — non-fatal. The scanner may still work for some
-    # endpoints without WARP, so we log a warning and proceed rather than abort.
+    # Startup WARP check + auto-connect. If WARP is inactive we attempt a
+    # best-effort `warp-cli connect`, wait briefly, and re-check. Non-fatal:
+    # we log WARNING and proceed either way so one bad morning does not lose
+    # a paper day of analyses.
     warp_active = check_warp_active()
+    warp_auto_connect_attempted = False
     if not warp_active:
         logger.warning(
-            "WARP_INACTIVE — scanner will likely return 0 candidates. "
-            "Enable Cloudflare WARP before scheduled run time."
+            "WARP_INACTIVE — attempting warp-cli connect (5s settle). "
+            "Enable Cloudflare WARP before scheduled run time for reliability."
         )
+        warp_auto_connect_attempted = True
+        try:
+            subprocess.run(
+                ["warp-cli", "connect"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            time.sleep(5)
+            warp_active = check_warp_active()
+            if warp_active:
+                logger.info("warp_auto_connect_ok — WARP is now active")
+            else:
+                logger.warning("warp_auto_connect_failed — scanner may return 0 candidates")
+        except FileNotFoundError:
+            logger.warning(
+                "warp_cli_not_found — install from https://1.1.1.1 and retry; "
+                "proceeding without WARP"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("warp_auto_connect_error error={}", exc)
+
+    # Crash-recovery lock file. Stale locks (dead PID) auto-clear with a
+    # scheduler_health "crashed" row so operators can see what happened.
+    if not _acquire_run_lock(workspace_root, cycles_planned=cycles):
+        logger.error("paper_loop_abort reason=run_lock_held_by_live_pid")
+        return 1
 
     config = load_config()
     executor = OrderExecutor(dry_run=dry_run, trades_path=workspace_root / "data" / "trades.jsonl")
     stop_requested = False
+    analyses_so_far = 0
 
     def _handle_signal(signum, frame):  # noqa: ANN001, ARG001
         nonlocal stop_requested
@@ -143,6 +274,11 @@ def run_paper_loop(
                 f"approved={summary['approved']} executed={summary['executed']}"
             )
 
+            # Heartbeat: one row per completed cycle so partially-completed
+            # runs (crash mid-way) still have a visible record in the health log.
+            analyses_so_far += int(summary.get("risk_decisions") or 0)
+            _append_heartbeat(workspace_root, cycle=iteration, analyses_so_far=analyses_so_far)
+
             if cycles > 0 and iteration >= cycles:
                 break
 
@@ -166,9 +302,14 @@ def run_paper_loop(
         # Best-effort health-record even on interrupted runs — operators need to
         # see that the day was disrupted, not pretend it didn't happen.
         try:
-            record_cycle_health(workspace_root, warp_active=warp_active)
+            record_cycle_health(
+                workspace_root,
+                warp_active=warp_active,
+                warp_auto_connect_attempted=warp_auto_connect_attempted,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("scheduler_health_write_failed error={}", exc)
+        _release_run_lock(workspace_root)
         return 130
 
     # End-of-run outcome resolver hook. The full daily cycle is:
@@ -198,10 +339,15 @@ def run_paper_loop(
     # Record scheduler health so the dashboard and prelive-checklist can gate
     # live-mode readiness on demonstrated reliability.
     try:
-        record_cycle_health(workspace_root, warp_active=warp_active)
+        record_cycle_health(
+            workspace_root,
+            warp_active=warp_active,
+            warp_auto_connect_attempted=warp_auto_connect_attempted,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("scheduler_health_write_failed error={}", exc)
 
+    _release_run_lock(workspace_root)
     return 0
 
 

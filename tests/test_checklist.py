@@ -54,12 +54,17 @@ def test_collect_pre_live_checks_aggregates(monkeypatch, tmp_path: Path) -> None
         "_check_scheduler_success_rate",
         lambda root: checklist.ChecklistItem("scheduler_success_rate_gte_80", True, "ok"),
     )
+    monkeypatch.setattr(
+        checklist,
+        "_check_warp_cli_installed",
+        lambda: checklist.ChecklistItem("warp_cli_installed", True, "ok"),
+    )
     monkeypatch.setattr(checklist, "_check_access", lambda: [checklist.ChecklistItem("access", True, "ok")])
 
     ready, items = checklist.run_pre_live_checklist(workspace_root=tmp_path, db_path=str(tmp_path / "db.sqlite"))
 
     assert ready is True
-    assert len(items) == 15
+    assert len(items) == 16
 
 
 def test_check_wallet_address_valid_missing(monkeypatch) -> None:

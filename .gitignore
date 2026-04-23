@@ -42,6 +42,11 @@ htmlcov/
 # Personal Claude memory files and ad-hoc scratch scripts.
 memory/
 test.py
+requirements_lock.txt
+scripts/dev/
+
+# --- MCP / local tooling ------------------------------------------
+.mcp.json
 
 # --- Editor / OS --------------------------------------------------
 .vscode/
@@ -51,3 +56,4 @@ test.py
 .DS_Store
 Thumbs.db
 desktop.ini
+.claude/worktrees/

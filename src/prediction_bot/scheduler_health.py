@@ -50,16 +50,27 @@ def _count_analyses_today(workspace_root: Path) -> int:
     return n
 
 
-def record_cycle_health(workspace_root: Path, *, warp_active: bool | None = None) -> dict[str, Any]:
+def record_cycle_health(
+    workspace_root: Path,
+    *,
+    warp_active: bool | None = None,
+    warp_auto_connect_attempted: bool = False,
+    status_override: str | None = None,
+    reason_override: str | None = None,
+) -> dict[str, Any]:
     """Write a single scheduler-health row for today's run and return it.
 
     Called at the end of a paper-loop run. Status is "ok" if at least one
-    analysis was written today, "missed" otherwise.
+    analysis was written today, "missed" otherwise. Callers may pass
+    status_override="crashed" when recovering from a stale run.lock.
     """
     analyses_today = _count_analyses_today(workspace_root)
     if warp_active is None:
         warp_active = check_warp_active()
-    if analyses_today > 0:
+    if status_override is not None:
+        status = status_override
+        reason = reason_override or "override"
+    elif analyses_today > 0:
         status = "ok"
         reason = "analyses_written"
     else:
@@ -71,6 +82,7 @@ def record_cycle_health(workspace_root: Path, *, warp_active: bool | None = None
         "status": status,
         "reason": reason,
         "warp_active": bool(warp_active),
+        "warp_auto_connect_attempted": bool(warp_auto_connect_attempted),
         "analyses_today": analyses_today,
         "timestamp": _utc_now_iso(),
     }
