@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -515,6 +516,168 @@ def _openai_tool_schema() -> dict[str, Any]:
     }
 
 
+_THINK_RE = re.compile(r"<think\b[^>]*>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking(text: str) -> tuple[str, str]:
+    """Strip a leading <think>...</think> block (DeepSeek R1 style).
+
+    Returns (stripped_content, captured_thinking). Both default to empty
+    strings if the input is empty.
+    """
+    if not text:
+        return "", ""
+    match = _THINK_RE.search(text)
+    if not match:
+        return text, ""
+    thinking = match.group(1).strip()
+    stripped = (text[: match.start()] + text[match.end():]).strip()
+    return stripped, thinking
+
+
+def _looks_like_auth_error(exc: Exception) -> bool:
+    msg = (str(exc) or "").lower()
+    if any(needle in msg for needle in ("401", "403", "unauthorized", "invalid api key", "authentication")):
+        return True
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    return status in {401, 403}
+
+
+def _looks_like_rate_limit(exc: Exception) -> bool:
+    msg = (str(exc) or "").lower()
+    if "429" in msg or "rate" in msg and "limit" in msg:
+        return True
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    return status == 429
+
+
+class NvidiaProvider:
+    """NVIDIA NIM provider, OpenAI-compatible API at integrate.api.nvidia.com.
+
+    Default model is DeepSeek R1, a reasoning model that emits a
+    <think>...</think> block before its final answer. We strip the block
+    before parsing the tool call, then capture the thinking length and a
+    truncated preview into the AnalysisResult.reasoning field so we can
+    audit what R1 thought about without bloating the prompt log.
+
+    On auth (401/403) or rate-limit (429) errors we raise — the analyst's
+    chain handler catches and falls through to the next provider.
+    """
+
+    name = "nvidia"
+    base_url = "https://integrate.api.nvidia.com/v1"
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        temperature: float = 0.6,
+        max_tokens: int = 4096,
+    ) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.temperature = float(temperature)
+        self.max_tokens = int(max_tokens)
+        self._client: Any | None = None
+        self._last_thinking: str = ""
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            module = importlib.import_module("openai")
+            self._client = module.OpenAI(api_key=self.api_key, base_url=self.base_url)
+        return self._client
+
+    def call(self, system_prompt: str, user_prompt: str) -> ProviderResponse:
+        client = self._get_client()
+        try:
+            response = client.chat.completions.create(
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                stream=False,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                tools=[_openai_tool_schema()],
+                tool_choice={"type": "function", "function": {"name": "answer"}},
+            )
+        except Exception as exc:
+            if _looks_like_auth_error(exc):
+                logger.warning(
+                    "nvidia_auth_failed - possible India region restriction on build.nvidia.com"
+                )
+            elif _looks_like_rate_limit(exc):
+                logger.warning("nvidia_rate_limited - falling through to next provider")
+            raise
+
+        usage = getattr(response, "usage", None)
+        input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+
+        tool_input: dict[str, Any] | None = None
+        choices = getattr(response, "choices", None) or []
+        message = getattr(choices[0], "message", None) if choices else None
+
+        # Reasoning models often put the structured tool call into tool_calls,
+        # but if the model emits <think>...</think> in the message content we
+        # still want to capture and trim it for audit purposes.
+        content_text = ""
+        if message is not None:
+            content_text = getattr(message, "content", None) or ""
+
+        cleaned_content, thinking = _strip_thinking(content_text)
+        if thinking:
+            self._last_thinking = thinking
+            logger.debug(
+                "nvidia_thinking model={} chars={}",
+                self.model, len(thinking),
+            )
+
+        if message is not None:
+            tool_calls = getattr(message, "tool_calls", None) or []
+            for tc in tool_calls:
+                fn = getattr(tc, "function", None)
+                if fn is None or getattr(fn, "name", None) != "answer":
+                    continue
+                args_raw = getattr(fn, "arguments", None)
+                if isinstance(args_raw, str):
+                    try:
+                        parsed = json.loads(args_raw)
+                    except (TypeError, ValueError):
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        tool_input = parsed
+                        break
+                elif isinstance(args_raw, dict):
+                    tool_input = args_raw
+                    break
+
+        # Some R1 deployments emit JSON inline rather than via tool_calls.
+        # Fall back to parsing the cleaned content.
+        if tool_input is None and cleaned_content:
+            try:
+                parsed = json.loads(cleaned_content)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                tool_input = parsed
+
+        # If we captured thinking, prepend a tagged preview to the reasoning
+        # field so audits can see what R1 actually reasoned about.
+        if tool_input is not None and thinking:
+            preview = thinking.replace("\n", " ")[:100]
+            current_reasoning = str(tool_input.get("reasoning") or "")
+            tool_input["reasoning"] = (f"[think:{len(thinking)}c] {preview} || {current_reasoning}")[:200]
+
+        return ProviderResponse(
+            tool_input=tool_input,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=0.0,
+        )
+
+
 class GroqProvider:
     name = "groq"
     base_url = "https://api.groq.com/openai/v1"
@@ -666,6 +829,10 @@ class StubProvider:
 def build_provider_chain(
     *,
     preferred: str | None = None,
+    nvidia_api_key: str | None = None,
+    nvidia_model: str | None = None,
+    nvidia_temperature: float | None = None,
+    nvidia_max_tokens: int | None = None,
     groq_api_key: str | None = None,
     groq_model: str | None = None,
     anthropic_api_key: str | None = None,
@@ -673,11 +840,21 @@ def build_provider_chain(
     ollama_base_url: str | None = None,
     ollama_model: str | None = None,
 ) -> list[AnalystProvider]:
-    """Build the provider chain in priority order: groq, anthropic, ollama, stub.
+    """Build the provider chain in priority order: nvidia, groq, anthropic, ollama, stub.
 
     Reads from env when a kwarg is None. The `preferred` provider, if reachable,
-    is moved to the front of the chain.
+    is moved to the front of the chain. ANALYST_PROVIDER env var is honoured.
     """
+    nvidia_key = nvidia_api_key if nvidia_api_key is not None else os.getenv("NVIDIA_API_KEY", "").strip()
+    nvidia_model_name = nvidia_model or os.getenv("NVIDIA_MODEL", "deepseek-ai/deepseek-r1")
+    try:
+        nvidia_temp = float(nvidia_temperature if nvidia_temperature is not None else os.getenv("NVIDIA_TEMPERATURE", "0.6"))
+    except (TypeError, ValueError):
+        nvidia_temp = 0.6
+    try:
+        nvidia_max = int(nvidia_max_tokens if nvidia_max_tokens is not None else os.getenv("NVIDIA_MAX_TOKENS", "4096"))
+    except (TypeError, ValueError):
+        nvidia_max = 4096
     groq_key = groq_api_key if groq_api_key is not None else os.getenv("GROQ_API_KEY", "").strip()
     groq_model_name = groq_model or os.getenv("GROQ_MODEL", "llama3-70b-8192")
     anthropic_key = anthropic_api_key if anthropic_api_key is not None else os.getenv("ANTHROPIC_API_KEY", "").strip()
@@ -686,6 +863,13 @@ def build_provider_chain(
     ollama_model_name = ollama_model or os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 
     chain: list[AnalystProvider] = []
+    if nvidia_key:
+        chain.append(NvidiaProvider(
+            api_key=nvidia_key,
+            model=nvidia_model_name,
+            temperature=nvidia_temp,
+            max_tokens=nvidia_max,
+        ))
     if groq_key:
         chain.append(GroqProvider(api_key=groq_key, model=groq_model_name))
     if anthropic_key:

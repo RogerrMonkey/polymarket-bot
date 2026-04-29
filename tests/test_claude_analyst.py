@@ -197,6 +197,10 @@ def _patch_imports(monkeypatch, *, anthropic_cls=None, openai_cls=None) -> None:
 
 def _clean_env(monkeypatch) -> None:
     for k in (
+        "NVIDIA_API_KEY",
+        "NVIDIA_MODEL",
+        "NVIDIA_TEMPERATURE",
+        "NVIDIA_MAX_TOKENS",
         "GROQ_API_KEY",
         "GROQ_MODEL",
         "ANTHROPIC_API_KEY",
@@ -582,3 +586,208 @@ def test_build_prompt_reports_no_relevant_news_when_nothing_matches() -> None:
     news = [_news_item("NBA playoffs bracket update", "lakers celtics")]
     prompt = build_prompt(market, news, chainlink_price=None)
     assert "no_relevant_news_found_for_this_market" in prompt
+
+
+# --------------------------------------------------------------------------- #
+# NVIDIA NIM provider                                                         #
+# --------------------------------------------------------------------------- #
+
+
+from prediction_bot.claude_analyst import (  # noqa: E402
+    NvidiaProvider,
+    _looks_like_auth_error,
+    _looks_like_rate_limit,
+    _strip_thinking,
+)
+
+
+class _FakeNvidiaCompletions:
+    """Configurable fake. Either returns a payload or raises an Exception."""
+
+    def __init__(self, *, payload=None, exc: Exception | None = None) -> None:
+        self.payload = payload
+        self.exc = exc
+        self.last_kwargs: dict | None = None
+
+    def create(self, **kwargs):  # noqa: ANN003, ANN202
+        self.last_kwargs = kwargs
+        if self.exc is not None:
+            raise self.exc
+        return self.payload
+
+
+def _nvidia_response_with_thinking(thinking: str, args: dict) -> _FakeOpenAIResponse:
+    """Build a fake response whose content has <think>...</think> + a tool_call."""
+    return _FakeOpenAIResponse(
+        choices=[
+            _FakeOpenAIChoice(
+                message=_FakeOpenAIMessage(
+                    tool_calls=[
+                        _FakeOpenAIToolCall(
+                            function=_FakeOpenAIFunction(
+                                name="answer",
+                                arguments=json.dumps(args),
+                            )
+                        )
+                    ]
+                )
+            )
+        ],
+        usage=_FakeOpenAIUsage(prompt_tokens=200, completion_tokens=50),
+    )
+
+
+def _install_fake_openai_for_nvidia(monkeypatch, completions: _FakeNvidiaCompletions) -> None:
+    class _Client:
+        def __init__(self, **_):  # noqa: ANN003
+            self.chat = SimpleNamespace(completions=completions)
+
+    fake_module = SimpleNamespace(OpenAI=_Client)
+    real_import = importlib.import_module
+
+    def _import(name, *a, **kw):  # noqa: ANN003
+        if name == "openai":
+            return fake_module
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(importlib, "import_module", _import)
+
+
+def test_strip_thinking_extracts_block() -> None:
+    cleaned, thinking = _strip_thinking("<think>step one</think>{}")
+    assert cleaned == "{}"
+    assert thinking == "step one"
+
+
+def test_strip_thinking_passthrough_when_absent() -> None:
+    cleaned, thinking = _strip_thinking("hello world")
+    assert cleaned == "hello world"
+    assert thinking == ""
+
+
+def test_looks_like_auth_error_detects_401() -> None:
+    assert _looks_like_auth_error(Exception("HTTP 401 Unauthorized"))
+    assert _looks_like_auth_error(Exception("invalid api key"))
+
+
+def test_looks_like_rate_limit_detects_429() -> None:
+    assert _looks_like_rate_limit(Exception("HTTP 429 too many requests"))
+
+
+def test_nvidia_provider_parses_tool_call_with_thinking_tags(monkeypatch) -> None:
+    """Mock returns <think>...</think> followed by a tool_call. Verify the
+    thinking is stripped, the tool call parsed, and a [think:Nc] preview
+    appears in the reasoning field."""
+    payload = _nvidia_response_with_thinking(
+        thinking="weighing base rate vs news evidence",
+        args={
+            "probability": 0.62,
+            "decision": "YES",
+            "confidence": "Medium",
+            "reasoning": "base rate + recent rally",
+            "data_sources_used": ["nvidia"],
+        },
+    )
+    # Inject thinking content into the message field too so _strip_thinking fires
+    payload.choices[0].message = _FakeOpenAIMessage(tool_calls=payload.choices[0].message.tool_calls)
+    # Fake an attribute that the provider reads via getattr(message, "content", None)
+    setattr(payload.choices[0].message, "content", "<think>weighing base rate vs news evidence</think>")
+
+    completions = _FakeNvidiaCompletions(payload=payload)
+    _install_fake_openai_for_nvidia(monkeypatch, completions)
+
+    provider = NvidiaProvider(api_key="nv-test", model="deepseek-ai/deepseek-r1")
+    response = provider.call(system_prompt="sys", user_prompt="usr")
+
+    assert response.tool_input is not None
+    # Tool call args were parsed
+    assert response.tool_input["decision"] == "YES"
+    assert response.tool_input["confidence"] == "Medium"
+    # Thinking preview was prepended to reasoning
+    assert "[think:" in response.tool_input["reasoning"]
+    assert "weighing base rate" in response.tool_input["reasoning"]
+
+
+def test_nvidia_provider_rate_limit_raises_chain_falls_through(monkeypatch, tmp_path: Path) -> None:
+    completions = _FakeNvidiaCompletions(exc=Exception("HTTP 429 rate limit exceeded"))
+    _install_fake_openai_for_nvidia(monkeypatch, completions)
+    provider = NvidiaProvider(api_key="nv", model="m")
+
+    # Direct call raises (chain handler in ClaudeAnalyst catches it).
+    import pytest
+
+    with pytest.raises(Exception, match="429"):
+        provider.call("s", "u")
+
+
+def test_nvidia_provider_auth_error_raises(monkeypatch) -> None:
+    completions = _FakeNvidiaCompletions(exc=Exception("HTTP 401 Unauthorized"))
+    _install_fake_openai_for_nvidia(monkeypatch, completions)
+    provider = NvidiaProvider(api_key="nv", model="m")
+
+    import pytest
+
+    with pytest.raises(Exception, match="401"):
+        provider.call("s", "u")
+
+
+def test_chain_fallthrough_from_nvidia_auth_error_to_groq(monkeypatch, tmp_path: Path) -> None:
+    """End-to-end: nvidia auth failure -> groq picks up cleanly."""
+
+    class _NvidiaAuthFail:
+        name = "nvidia"
+        model = "deepseek-r1"
+
+        def call(self, system_prompt: str, user_prompt: str) -> ProviderResponse:  # noqa: ARG002
+            raise Exception("HTTP 401 Unauthorized")
+
+    class _GroqOK:
+        name = "groq"
+        model = "llama"
+
+        def call(self, system_prompt: str, user_prompt: str) -> ProviderResponse:  # noqa: ARG002
+            return ProviderResponse(
+                tool_input={
+                    "probability": 0.55,
+                    "decision": "YES",
+                    "confidence": "Medium",
+                    "reasoning": "fallback",
+                    "data_sources_used": [],
+                },
+                input_tokens=10, output_tokens=5, cost_usd=0.0,
+            )
+
+    analyst = ClaudeAnalyst(
+        providers=[_NvidiaAuthFail(), _GroqOK(), StubProvider()],
+        log_path=tmp_path / "analyses.jsonl",
+    )
+    result = analyst.analyze(market=_market(), news_items=[], chainlink_price=None)
+    assert result.provider == "groq"
+
+
+def test_build_provider_chain_nvidia_first_when_key_set(monkeypatch) -> None:
+    _clean_env(monkeypatch)
+    monkeypatch.setenv("NVIDIA_API_KEY", "nv")
+    monkeypatch.setenv("GROQ_API_KEY", "g")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
+    chain = build_provider_chain()
+    names = [p.name for p in chain]
+    assert names == ["nvidia", "groq", "anthropic", "ollama", "stub"]
+
+
+def test_build_provider_chain_preferred_nvidia_override(monkeypatch) -> None:
+    _clean_env(monkeypatch)
+    monkeypatch.setenv("NVIDIA_API_KEY", "nv")
+    monkeypatch.setenv("GROQ_API_KEY", "g")
+    chain = build_provider_chain(preferred="groq")
+    assert [p.name for p in chain][0] == "groq"
+    # nvidia should still be in the chain (just not first)
+    assert "nvidia" in [p.name for p in chain]
+
+
+def test_build_provider_chain_no_nvidia_key_skips_nvidia(monkeypatch) -> None:
+    _clean_env(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", "g")
+    chain = build_provider_chain()
+    assert "nvidia" not in [p.name for p in chain]
+    assert [p.name for p in chain] == ["groq", "ollama", "stub"]

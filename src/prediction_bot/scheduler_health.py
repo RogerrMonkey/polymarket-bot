@@ -113,11 +113,15 @@ def read_scheduler_health(workspace_root: Path, limit: int | None = None) -> lis
 
 
 def success_rate(workspace_root: Path, window: int = 14) -> tuple[float | None, int, int]:
-    """Return (success_rate, ok_count, total) over last `window` entries.
+    """Return (success_rate, ok_count, total) over last `window` cycle rows.
 
-    Returns (None, 0, 0) if there are no entries at all.
+    Heartbeat rows are excluded from the calculation — only end-of-cycle
+    rows (status: ok | missed | crashed) count toward the rate.
+    Returns (None, 0, 0) if there are no cycle entries at all.
     """
-    rows = read_scheduler_health(workspace_root, limit=window)
+    all_rows = read_scheduler_health(workspace_root)
+    cycle_rows = [r for r in all_rows if str(r.get("type") or "") != "heartbeat"]
+    rows = cycle_rows[-window:] if window > 0 else cycle_rows
     total = len(rows)
     if total == 0:
         return None, 0, 0
