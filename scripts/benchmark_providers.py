@@ -22,6 +22,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ANALYSES = ROOT / "data" / "analyses.jsonl"
 
+# Load .env explicitly — running the script from the venv does not pick it
+# up automatically the way `python -m prediction_bot ...` does (where
+# load_config() calls dotenv).
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env")
+except ImportError:
+    pass
+
 
 def _read_after(timestamp: str) -> list[dict]:
     """Return analyses with timestamp >= the given ISO string."""

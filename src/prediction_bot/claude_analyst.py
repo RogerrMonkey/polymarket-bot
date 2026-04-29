@@ -846,7 +846,12 @@ def build_provider_chain(
     is moved to the front of the chain. ANALYST_PROVIDER env var is honoured.
     """
     nvidia_key = nvidia_api_key if nvidia_api_key is not None else os.getenv("NVIDIA_API_KEY", "").strip()
-    nvidia_model_name = nvidia_model or os.getenv("NVIDIA_MODEL", "deepseek-ai/deepseek-r1")
+    # Default model: NVIDIA's own Nemotron Super 49B. DeepSeek R1 was EOL'd
+    # by NVIDIA NIM on 2026-01-26 (HTTP 410 Gone); Nemotron is the live
+    # NVIDIA-flavoured model that emits clean tool calls.
+    nvidia_model_name = nvidia_model or os.getenv(
+        "NVIDIA_MODEL", "nvidia/llama-3.3-nemotron-super-49b-v1"
+    )
     try:
         nvidia_temp = float(nvidia_temperature if nvidia_temperature is not None else os.getenv("NVIDIA_TEMPERATURE", "0.6"))
     except (TypeError, ValueError):
