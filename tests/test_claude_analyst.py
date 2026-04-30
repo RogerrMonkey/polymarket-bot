@@ -791,3 +791,123 @@ def test_build_provider_chain_no_nvidia_key_skips_nvidia(monkeypatch) -> None:
     chain = build_provider_chain()
     assert "nvidia" not in [p.name for p in chain]
     assert [p.name for p in chain] == ["groq", "ollama", "stub"]
+
+
+# --------------------------------------------------------------------------- #
+# _extract_content: dual-format reasoning extraction                          #
+# --------------------------------------------------------------------------- #
+
+
+from prediction_bot.claude_analyst import _extract_content  # noqa: E402
+
+
+class _MsgKimi:
+    """Mimic a Kimi K2 thinking response: separate reasoning_content field."""
+    def __init__(self, content: str, reasoning_content: str) -> None:
+        self.content = content
+        self.reasoning_content = reasoning_content
+
+
+class _MsgDeepseek:
+    """Mimic a DeepSeek R1 response: <think> embedded in content."""
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+def test_extract_content_kimi_reasoning_content_field() -> None:
+    msg = _MsgKimi(content="final answer", reasoning_content="step 1 step 2")
+    content, thinking = _extract_content(msg)
+    assert content == "final answer"
+    assert thinking == "step 1 step 2"
+
+
+def test_extract_content_kimi_empty_reasoning_falls_back_to_think_tags() -> None:
+    msg = _MsgKimi(content="<think>fallback</think>plain", reasoning_content="")
+    content, thinking = _extract_content(msg)
+    assert content == "plain"
+    assert thinking == "fallback"
+
+
+def test_extract_content_deepseek_think_tags() -> None:
+    msg = _MsgDeepseek(content="<think>chain of thought</think>{\"x\":1}")
+    content, thinking = _extract_content(msg)
+    assert content == '{"x":1}'
+    assert thinking == "chain of thought"
+
+
+def test_extract_content_no_thinking() -> None:
+    msg = _MsgDeepseek(content="just an answer")
+    content, thinking = _extract_content(msg)
+    assert content == "just an answer"
+    assert thinking == ""
+
+
+def test_extract_content_handles_none_message() -> None:
+    content, thinking = _extract_content(None)
+    assert content == ""
+    assert thinking == ""
+
+
+def test_nvidia_provider_kimi_reasoning_content_field(monkeypatch) -> None:
+    """Full provider call: Kimi-style response with reasoning_content
+    populated should land in the [think:Nc] preview just like the
+    <think>-tag path does for DeepSeek."""
+    payload = _FakeOpenAIResponse(
+        choices=[
+            _FakeOpenAIChoice(
+                message=_FakeOpenAIMessage(
+                    tool_calls=[
+                        _FakeOpenAIToolCall(
+                            function=_FakeOpenAIFunction(
+                                name="answer",
+                                arguments=json.dumps(
+                                    {
+                                        "probability": 0.55,
+                                        "decision": "YES",
+                                        "confidence": "Medium",
+                                        "reasoning": "kimi reasoning summary",
+                                        "data_sources_used": ["kimi"],
+                                    }
+                                ),
+                            )
+                        )
+                    ]
+                )
+            )
+        ],
+        usage=_FakeOpenAIUsage(prompt_tokens=300, completion_tokens=120),
+    )
+    # Kimi-style: reasoning_content attribute set, content empty (or only the answer)
+    setattr(payload.choices[0].message, "content", "")
+    setattr(payload.choices[0].message, "reasoning_content", "weighing base rate vs current news")
+
+    completions = _FakeNvidiaCompletions(payload=payload)
+    _install_fake_openai_for_nvidia(monkeypatch, completions)
+    provider = NvidiaProvider(api_key="nv", model="moonshotai/kimi-k2-thinking", temperature=1.0, max_tokens=8192)
+    response = provider.call("sys", "usr")
+
+    assert response.tool_input is not None
+    # Kimi reasoning_content should have been prepended as [think:Nc] preview
+    assert response.tool_input["reasoning"].startswith("[think:")
+    assert "weighing base rate" in response.tool_input["reasoning"]
+
+
+def test_nvidia_provider_thinking_mode_temperature_passthrough(monkeypatch) -> None:
+    """Verify NvidiaProvider passes the configured temperature to NIM."""
+    payload = _FakeOpenAIResponse(
+        choices=[_FakeOpenAIChoice(
+            message=_FakeOpenAIMessage(tool_calls=[]),
+        )],
+        usage=_FakeOpenAIUsage(prompt_tokens=10, completion_tokens=5),
+    )
+    setattr(payload.choices[0].message, "content", "")
+    completions = _FakeNvidiaCompletions(payload=payload)
+    _install_fake_openai_for_nvidia(monkeypatch, completions)
+
+    provider = NvidiaProvider(api_key="nv", model="moonshotai/kimi-k2-thinking", temperature=1.0, max_tokens=8192)
+    provider.call("sys", "usr")
+
+    kwargs = completions.last_kwargs or {}
+    assert kwargs.get("temperature") == 1.0
+    assert kwargs.get("max_tokens") == 8192
+    assert kwargs.get("model") == "moonshotai/kimi-k2-thinking"

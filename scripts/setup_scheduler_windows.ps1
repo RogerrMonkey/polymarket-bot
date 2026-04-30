@@ -24,7 +24,7 @@ param(
     [string]$TriggerUTC      = "03:00",
     [string]$WarpUpUTC       = "02:55",
     [string]$WarpDownUTC     = "04:00",
-    [int]   $Cycles          = 20,
+    [int]   $Cycles          = 30,
     [int]   $Interval        = 60
 )
 

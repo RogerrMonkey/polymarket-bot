@@ -35,12 +35,25 @@ class WatchlistManager:
             unique.append(val)
         self.watchlist_path.write_text(json.dumps(unique, indent=2), encoding="utf-8")
 
-    def refresh_watchlist(self) -> list[str]:
+    def refresh_watchlist(self, limit: int = 100) -> list[str]:
+        """Pull the top-volume currently-open markets and rewrite watchlist.json.
+
+        Uses Gamma's `closed=false` and `volumeNum`-descending ordering so
+        the result is always live, never expired. `limit` controls how many
+        market IDs are kept (default 50; the prior 20 was too narrow and
+        churned through near-expiry markets within days).
+        """
+        # Order by volume24hr to match `PolymarketClient.fetch_markets`. If
+        # we ordered by volumeNum (lifetime volume) instead, the watchlist
+        # would tilt toward big old markets that are mostly resolved, while
+        # the client streams live 24h-active markets — almost no overlap,
+        # so the watchlist filter would drop everything (the bug we hit).
         payload = self.http.get_json(
             "https://gamma-api.polymarket.com/markets",
             params={
-                "limit": "20",
+                "limit": str(int(limit)),
                 "active": "true",
+                "closed": "false",
                 "order": "volume24hr",
                 "ascending": "false",
             },

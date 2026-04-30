@@ -298,6 +298,27 @@ def run_notify_alerts_command(force: bool) -> int:
     return 0 if result.sent else 1
 
 
+def run_refresh_watchlist_command(limit: int) -> int:
+    """Pull the top-volume currently-open markets and rewrite watchlist.json."""
+    from prediction_bot.watchlist import WatchlistManager
+
+    config = load_config()
+    http = HttpClient(
+        timeout_seconds=config.runtime.request_timeout_seconds,
+        user_agent=config.runtime.user_agent,
+    )
+    root = Path(".").resolve()
+    manager = WatchlistManager(http=http, watchlist_path=root / "watchlist.json")
+    try:
+        ids = manager.refresh_watchlist(limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        print(f"refresh_failed: {exc}")
+        return 1
+    print(f"watchlist refreshed: {len(ids)} markets")
+    print(f"path={root / 'watchlist.json'}")
+    return 0
+
+
 def run_news_check_command(limit: int) -> int:
     """Smoke test the GDELT + RSS news pipeline; print the top N headlines."""
     from prediction_bot.research.news_feed import (
@@ -483,6 +504,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("verify-auth", help="Run authenticated CLOB credential checks")
     sub.add_parser("health-check", help="Print a one-page system health snapshot")
     sub.add_parser("live-readiness", help="Evaluate live-mode readiness gates")
+    refresh = sub.add_parser("refresh-watchlist", help="Refresh watchlist.json with top-volume open Polymarket markets")
+    refresh.add_argument("--limit", type=int, default=50)
 
     news = sub.add_parser("news-check", help="Smoke test the news pipeline; print top headlines")
     news.add_argument("--limit", type=int, default=3)
@@ -559,6 +582,8 @@ def main() -> int:
             workspace_root=Path(".").resolve(),
             db_path=config.storage.db_path,
         )
+    if args.command == "refresh-watchlist":
+        return run_refresh_watchlist_command(limit=args.limit)
 
     parser.error("Unknown command")
     return 2

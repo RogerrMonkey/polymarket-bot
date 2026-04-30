@@ -91,6 +91,53 @@ def _brier(db_path: str) -> tuple[float | None, int]:
         return None, 0
 
 
+def _today_analyses_breakdown(workspace_root: Path) -> dict[str, int]:
+    """Return today's BUY/SELL/SKIP counts from analyses.jsonl."""
+    out = {"BUY": 0, "SELL": 0, "SKIP": 0, "total": 0}
+    path = workspace_root / "data" / "analyses.jsonl"
+    if not path.exists():
+        return out
+    today = datetime.now(timezone.utc).date().isoformat()
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        ts = str(row.get("timestamp") or "")
+        if ts[:10] != today:
+            continue
+        decision = str(row.get("decision") or "").upper()
+        if decision == "YES":
+            decision = "BUY"
+        elif decision == "NO":
+            decision = "SELL"
+        if decision in {"BUY", "SELL", "SKIP"}:
+            out[decision] += 1
+            out["total"] += 1
+    return out
+
+
+def _watchlist_status(workspace_root: Path) -> str:
+    """Quick freshness signal: count of IDs and last-modified hours-ago."""
+    path = workspace_root / "watchlist.json"
+    if not path.exists():
+        return "missing"
+    try:
+        ids = json.loads(path.read_text(encoding="utf-8"))
+        n = len(ids) if isinstance(ids, list) else 0
+    except Exception:  # noqa: BLE001
+        return "unreadable"
+    if n == 0:
+        return "empty"
+    age_hours = (datetime.now(timezone.utc).timestamp() - path.stat().st_mtime) / 3600.0
+    age_str = f"{int(age_hours)}h" if age_hours < 96 else f"{int(age_hours/24)}d"
+    label = "fresh" if age_hours < 168 else "stale"
+    return f"{n} markets, {label} (updated {age_str} ago)"
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
     if raw in {"1", "true", "yes", "on"}:
@@ -124,6 +171,8 @@ def collect_health(workspace_root: Path, db_path: str) -> dict[str, Any]:
         "total_trades": pnl.get("total_trades", 0),
         "kill_switch": _env_bool("KILL_SWITCH"),
         "live_mode": _env_bool("BOT_LIVE_MODE"),
+        "today_analyses": _today_analyses_breakdown(workspace_root),
+        "watchlist_status": _watchlist_status(workspace_root),
     }
 
 
@@ -166,6 +215,9 @@ def print_health(data: dict[str, Any]) -> None:
     print(f"Resolved markets : {data['resolved_markets']}")
     print(f"Brier score      : {brier}")
     print(f"Bankroll (paper) : {bankroll}")
+    today = data.get("today_analyses") or {"total": 0, "BUY": 0, "SELL": 0, "SKIP": 0}
+    print(f"Today's analyses : {today.get('total', 0)} ({today.get('BUY', 0)} BUY, {today.get('SELL', 0)} SELL, {today.get('SKIP', 0)} SKIP)")
+    print(f"Watchlist status : {data.get('watchlist_status', 'unknown')}")
     print(f"Kill switch      : {ks}")
     print(f"Live mode        : {lm}")
     print("-----------------------------")

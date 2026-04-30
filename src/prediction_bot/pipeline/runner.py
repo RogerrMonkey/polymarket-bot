@@ -126,14 +126,33 @@ def execute_scan_run(
         except Exception:  # noqa: BLE001
             watchlist = []
 
-    if watchlist:
-        watchset = set(watchlist)
-        filtered_snapshots = []
-        for snap in ingestion.snapshots:
+    def _apply_watchlist(snapshots, ids: list[str]):
+        watchset = set(ids)
+        kept = []
+        for snap in snapshots:
             cid = _condition_id(snap)
             if cid is None or cid in watchset:
-                filtered_snapshots.append(snap)
-        ingestion.snapshots = filtered_snapshots
+                kept.append(snap)
+        return kept
+
+    if watchlist:
+        original_count = len(ingestion.snapshots)
+        ingestion.snapshots = _apply_watchlist(ingestion.snapshots, watchlist)
+        # Self-heal: if the watchlist filter dropped EVERYTHING but the
+        # ingestor returned markets, the watchlist is stale. Refresh once
+        # against Gamma's current top-volume open markets and re-apply.
+        if original_count > 0 and not ingestion.snapshots:
+            try:
+                fresh = watchlist_manager.refresh_watchlist(limit=100)
+                if fresh:
+                    ingestion.errors.append(
+                        f"watchlist_auto_refreshed:stale_dropped_all old_size={len(watchlist)} new_size={len(fresh)}"
+                    )
+                    # Re-ingest snapshots so we have the original list back
+                    ingestion = ingestor.run(limit_per_venue=limit_per_venue)
+                    ingestion.snapshots = _apply_watchlist(ingestion.snapshots, fresh)
+            except Exception as exc:  # noqa: BLE001
+                ingestion.errors.append(f"watchlist_refresh_failed:{exc}")
 
     scanner = MarketScanner(config.scan)
     candidates = scanner.scan(ingestion.snapshots)
