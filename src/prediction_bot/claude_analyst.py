@@ -372,7 +372,27 @@ def _normalize_decision(value: Any) -> str:
     return "SKIP"
 
 
-def build_prompt(market: MarketSnapshot, news_items: list[NewsItem], chainlink_price: float | None) -> str:
+def _smart_money_block(signal: Any) -> str:
+    """Render a SMART_MONEY_SIGNAL block for the user prompt.
+
+    `signal` is duck-typed (a SmartMoneySignal from research.smart_money,
+    or None). Kept here as Any to avoid a circular import.
+    """
+    if signal is None or getattr(signal, "traders_present", 0) == 0:
+        return "SMART_MONEY_SIGNAL: No top traders detected in this market."
+    yes_pct = float(getattr(signal, "weighted_yes_prob", 0.5)) * 100.0
+    return (
+        "SMART_MONEY_SIGNAL:\n"
+        f"  Top traders in market: {getattr(signal, 'traders_present', 0)}\n"
+        f"  Weighted direction:    {yes_pct:.0f}% YES\n"
+        f"  Consensus strength:    {getattr(signal, 'consensus_strength', 'Low')}\n"
+        f"  Largest position:      ${float(getattr(signal, 'largest_position_usdc', 0.0)):.0f}\n"
+        f"  Recent entries (24h):  {getattr(signal, 'recent_entries_24h', 0)}\n"
+        f"  Total smart money:     ${float(getattr(signal, 'total_smart_money_usdc', 0.0)):.0f}"
+    )
+
+
+def build_prompt(market: MarketSnapshot, news_items: list[NewsItem], chainlink_price: float | None, smart_money: Any = None) -> str:
     seconds_to_resolution = "unknown"
     days_remaining_text = "unknown"
     end_date_text = "unknown"
@@ -419,6 +439,9 @@ def build_prompt(market: MarketSnapshot, news_items: list[NewsItem], chainlink_p
         for item in relevant_news:
             sanitized = sanitize_for_prompt(item.raw_text or item.title)
             lines.append(f"[EXTERNAL_DATA] {sanitized} - {item.source} - {item.published_at.isoformat()}")
+
+    lines.append("")
+    lines.append(_smart_money_block(smart_money))
 
     lines.append("")
     lines.append(
@@ -993,6 +1016,7 @@ class ClaudeAnalyst:
         market: MarketSnapshot,
         news_items: list[NewsItem],
         chainlink_price: float | None,
+        smart_money: Any = None,
     ) -> AnalysisResult:
         market_price = market.yes_price if market.yes_price is not None else 0.5
 
@@ -1010,7 +1034,7 @@ class ClaudeAnalyst:
             self._log(market, result)
             return result
 
-        prompt = build_prompt(market, news_items, chainlink_price)
+        prompt = build_prompt(market, news_items, chainlink_price, smart_money=smart_money)
 
         last_error: str | None = None
         for provider in self.providers:

@@ -15,6 +15,11 @@ from prediction_bot.pipeline.ingest import UnifiedIngestor
 from prediction_bot.pipeline.research import ResearchPipeline
 from prediction_bot.research.market_filter import filter_markets
 from prediction_bot.research.news_feed import NewsItem, get_relevant_news
+from prediction_bot.research.smart_money import (
+    apply_smart_money_modifier,
+    fetch_smart_money_signal,
+    fetch_top_traders,
+)
 from prediction_bot.risk_engine import AnalysisResult as DeterministicAnalysisResult
 from prediction_bot.risk_engine import PortfolioState, RiskConfig, pre_trade_check
 from prediction_bot.storage.prediction_store import BrierMetrics, PredictionStore
@@ -162,6 +167,33 @@ def execute_scan_run(
     risk_config = RiskConfig.from_json_file(root / "risk_config.json")
     candidates = filter_markets(candidates, risk_config)
 
+    # Smart-money attachment: one /trades fetch per cycle to rank top wallets,
+    # then one /positions fetch per candidate to see if any of them hold a
+    # qualifying position. Failures are logged and never crash the pipeline.
+    smart_money_seen: set[tuple[str, str]] = set()
+    if candidates:
+        try:
+            top_traders = fetch_top_traders(http=http, workspace_root=root)
+        except Exception as exc:  # noqa: BLE001
+            top_traders = []
+            ingestion.errors.append(f"smart_money_top_traders_failed:{exc}")
+        for cand in candidates[:top_n_for_risk]:
+            condition_id = ""
+            if isinstance(cand.snapshot.raw, dict):
+                condition_id = str(cand.snapshot.raw.get("conditionId") or cand.snapshot.raw.get("condition_id") or "").strip()
+            if not condition_id or not top_traders:
+                continue
+            try:
+                cand.smart_money = fetch_smart_money_signal(
+                    condition_id,
+                    top_traders,
+                    http=http,
+                    workspace_root=root,
+                    seen=smart_money_seen,
+                )
+            except Exception as exc:  # noqa: BLE001
+                ingestion.errors.append(f"smart_money_signal_failed:{cand.snapshot.market_id}:{exc}")
+
     research_signals: dict[str, ResearchSignal] = {}
     if config.research.enabled and candidates:
         research = ResearchPipeline(
@@ -221,7 +253,13 @@ def execute_scan_run(
                 market=candidate.snapshot,
                 news_items=claude_news_items[:8],
                 chainlink_price=None,
+                smart_money=getattr(candidate, "smart_money", None),
             )
+            # Smart-money post-analysis modifier: HIGH+AGREE boosts edge,
+            # HIGH+CONTRADICT overrides decision to SKIP, MED+AGREE softer
+            # boost, otherwise no-op. See research/smart_money.py for the
+            # full table.
+            llm_result = apply_smart_money_modifier(llm_result, getattr(candidate, "smart_money", None))
             raw_model_probability = llm_result.probability
             confidence_label = llm_result.confidence
             decision_label = llm_result.decision

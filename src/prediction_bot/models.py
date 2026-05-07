@@ -35,6 +35,10 @@ class ScanCandidate:
     snapshot: MarketSnapshot
     opportunity_score: float
     anomaly_flags: list[str] = field(default_factory=list)
+    # Populated by the runner after market_filter when the smart-money
+    # layer is active. Typed as Any to avoid an import cycle into
+    # prediction_bot.research.smart_money.
+    smart_money: Any = None
 
 
 @dataclass

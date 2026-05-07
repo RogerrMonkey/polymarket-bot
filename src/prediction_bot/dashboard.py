@@ -396,7 +396,92 @@ def _last_analysis_run(analyses: list[dict[str, Any]]) -> dict[str, Any]:
     return {"label": label, "iso": latest.isoformat()}
 
 
-def _todays_analyses(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _read_smart_money_today(workspace_root: Path) -> list[dict[str, Any]]:
+    """Return today's smart_money.jsonl rows."""
+    path = workspace_root / "data" / "smart_money.jsonl"
+    if not path.exists():
+        return []
+    today = datetime.now(timezone.utc).date()
+    out: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        ts = _parse_iso(str(row.get("timestamp") or ""))
+        if ts is None or ts.date() != today:
+            continue
+        out.append(row)
+    return out
+
+
+def _smart_money_summary(workspace_root: Path, analyses_today: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate today's smart-money rows for the dashboard panel.
+
+    Looks at smart_money.jsonl entries from today AND scans today's
+    analyses.jsonl reasoning fields for the [SM:...] tags emitted by
+    apply_smart_money_modifier to count agreements/contradictions.
+    """
+    sm_rows = _read_smart_money_today(workspace_root)
+    markets_with_sm = sum(1 for r in sm_rows if int(r.get("traders_present") or 0) > 0)
+    total_usdc = sum(float(r.get("total_smart_money_usdc") or 0.0) for r in sm_rows)
+
+    strongest = None
+    for r in sm_rows:
+        if int(r.get("traders_present") or 0) <= 0:
+            continue
+        if strongest is None or float(r.get("total_smart_money_usdc") or 0) > float(strongest.get("total_smart_money_usdc") or 0):
+            strongest = r
+
+    agreements = 0
+    contradictions = 0
+    for a in analyses_today:
+        reasoning = str(a.get("reasoning") or "")
+        if "[SM:HIGH+AGREE" in reasoning or "[SM:MED+AGREE" in reasoning:
+            agreements += 1
+        elif "[SM:HIGH+CONTRADICT" in reasoning:
+            contradictions += 1
+
+    return {
+        "markets_with_signal": markets_with_sm,
+        "total_rows_today": len(sm_rows),
+        "total_usdc_tracked": round(total_usdc, 0),
+        "strongest": strongest,
+        "agreements": agreements,
+        "contradictions": contradictions,
+    }
+
+
+def _build_smart_money_index(workspace_root: Path) -> dict[str, dict[str, Any]]:
+    """Latest smart-money row per market_id from data/smart_money.jsonl.
+
+    Used to attach a SM pill to each card in Today's Analysis Feed.
+    Note: smart_money.jsonl uses conditionId as market_id, while
+    analyses.jsonl uses Polymarket numeric IDs. The pill lookup falls
+    back to checking [SM:...] tags in the reasoning if no direct match.
+    """
+    path = workspace_root / "data" / "smart_money.jsonl"
+    if not path.exists():
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        mid = str(row.get("market_id") or "")
+        if mid:
+            out[mid] = row
+    return out
+
+
+def _todays_analyses(analyses: list[dict[str, Any]], smart_money_index: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     today = datetime.now(timezone.utc).date()
     out: list[dict[str, Any]] = []
     for row in analyses:
@@ -413,6 +498,25 @@ def _todays_analyses(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
         reasoning = str(row.get("reasoning") or "").strip()
         if len(reasoning) > 200:
             reasoning = reasoning[:200]
+
+        # Smart-money pill: prefer direct conditionId lookup, then fall
+        # back to scanning the reasoning for SM tags.
+        sm_pill: dict[str, Any] | None = None
+        sm_row = (smart_money_index or {}).get(market_id)
+        if sm_row and int(sm_row.get("traders_present") or 0) > 0:
+            strength = str(sm_row.get("consensus_strength") or "Low")
+            sm_pill = {
+                "traders": int(sm_row.get("traders_present") or 0),
+                "yes_pct": int(round(float(sm_row.get("weighted_yes_prob") or 0.5) * 100)),
+                "strength": strength,
+                "total_usdc": float(sm_row.get("total_smart_money_usdc") or 0.0),
+                "color": "green" if strength == "High" else "amber" if strength == "Medium" else "grey",
+            }
+        elif "[SM:HIGH+AGREE" in reasoning or "[SM:MED+AGREE" in reasoning:
+            sm_pill = {"tag": "AGREE", "color": "green"}
+        elif "[SM:HIGH+CONTRADICT" in reasoning:
+            sm_pill = {"tag": "OVERRIDE→SKIP", "color": "red"}
+
         out.append(
             {
                 "timestamp": row.get("timestamp"),
@@ -425,6 +529,7 @@ def _todays_analyses(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "edge": row.get("edge"),
                 "provider": str(row.get("provider") or ""),
                 "reasoning": reasoning,
+                "smart_money": sm_pill,
             }
         )
     out.sort(key=lambda r: str(r.get("timestamp") or ""), reverse=True)
@@ -738,6 +843,15 @@ DASHBOARD_HTML = """
     .badge.grey  { background: #2d3443; color: #cbd5e1; }
     .badge.green { background: rgba(34, 197, 94, 0.18); color: var(--good); }
     .badge.red   { background: rgba(239, 68, 68, 0.18); color: var(--bad); }
+    .sm-pill {
+      display: inline-block; margin-top: 6px; padding: 2px 8px;
+      border-radius: 999px; font-size: 11px; font-weight: 500;
+      border: 1px solid var(--line);
+    }
+    .sm-pill.sm-green { background: rgba(34,197,94,0.10);  color: var(--good); border-color: rgba(34,197,94,0.30); }
+    .sm-pill.sm-amber { background: rgba(245,158,11,0.10); color: #f59e0b;     border-color: rgba(245,158,11,0.30); }
+    .sm-pill.sm-grey  { background: #2d3443;               color: #cbd5e1;     }
+    .sm-pill.sm-red   { background: rgba(239,68,68,0.10);  color: var(--bad);  border-color: rgba(239,68,68,0.30); }
     .check-item {
       display: grid; grid-template-columns: 16px 1fr auto; gap: 8px; align-items: start;
       padding: 4px 0; font-size: 13px; border-bottom: 1px solid transparent;
@@ -902,6 +1016,18 @@ DASHBOARD_HTML = """
                   {% if a.reasoning %}
                     <div class=\"reasoning\">“{{ a.reasoning }}”</div>
                   {% endif %}
+                  {% if a.smart_money %}
+                    <div class=\"sm-pill sm-{{ a.smart_money.color }}\">
+                      {% if a.smart_money.traders %}
+                        🐋 {{ a.smart_money.traders }} smart traders ·
+                        {{ a.smart_money.yes_pct }}% YES ·
+                        {{ a.smart_money.strength }} consensus ·
+                        ${{ \"{:,.0f}\".format(a.smart_money.total_usdc) }}
+                      {% else %}
+                        🐋 SM tag: {{ a.smart_money.tag }}
+                      {% endif %}
+                    </div>
+                  {% endif %}
                 </div>
                 <span class=\"badge {{ a.decision_class }}\">{{ a.decision }}</span>
               </div>
@@ -910,6 +1036,33 @@ DASHBOARD_HTML = """
             <div class=\"empty\">No analyses yet today — scheduler runs at 08:00 UTC</div>
           {% endif %}
         </div>
+      </div>
+
+      <!-- Smart Money Activity panel -->
+      <div class=\"panel\">
+        <div class=\"head\"><h2>Smart Money Activity</h2><span class=\"sub\">top traders by recent volume</span></div>
+        {% if smart_money and smart_money.total_rows_today > 0 %}
+          <div class=\"meta\">
+            Markets with smart money today: <b>{{ smart_money.markets_with_signal }}</b>
+            ({{ smart_money.total_rows_today }} markets probed) ·
+            tracked: <b>${{ \"{:,.0f}\".format(smart_money.total_usdc_tracked) }}</b>
+          </div>
+          <div class=\"meta\">
+            Agreements (model + SM aligned): <b>{{ smart_money.agreements }}</b> ·
+            Contradictions (SM overrode model): <b>{{ smart_money.contradictions }}</b>
+          </div>
+          {% if smart_money.strongest %}
+            <div class=\"meta\" style=\"margin-top:6px\">
+              Strongest signal: market <code>{{ smart_money.strongest.market_id[:20] }}…</code>
+              · {{ smart_money.strongest.consensus_strength }} consensus
+              · {{ smart_money.strongest.traders_present }} traders
+              · ${{ \"{:,.0f}\".format(smart_money.strongest.total_smart_money_usdc) }}
+              · {{ \"{:.0%}\".format(smart_money.strongest.weighted_yes_prob) }} YES
+            </div>
+          {% endif %}
+        {% else %}
+          <div class=\"empty\">No smart money data yet — runs after next paper-loop</div>
+        {% endif %}
       </div>
 
       <!-- Panel 4: Risk Log -->
@@ -1165,10 +1318,14 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
                 "awaiting_resolutions": True,
             }
 
+        sm_index = _build_smart_money_index(workspace_root)
+        todays_cards = _todays_analyses(analyses_all, smart_money_index=sm_index)
+        sm_summary = _smart_money_summary(workspace_root, todays_cards)
+
         return {
             "status": status,
             "paper_days": _paper_days_progress(analyses_all),
-            "todays_analyses": _todays_analyses(analyses_all),
+            "todays_analyses": todays_cards,
             "risk_rejections": _build_rejection_rows(recent_risk),
             "checklist_grouped": checklist_grouped,
             "perf": perf,
@@ -1179,6 +1336,7 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
             "resolver_counts": resolver_counts,
             "scheduler_health": read_scheduler_health(workspace_root, limit=7),
             "scheduler_success": success_rate(workspace_root, window=14),
+            "smart_money": sm_summary,
         }
 
     def _legacy_state() -> dict[str, Any]:
@@ -1269,6 +1427,9 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
         paper_days = _paper_days_progress(analyses_all)
         pass_count = sum(1 for c in checks if getattr(c, "passed", False))
         live_mode = (os.getenv("BOT_LIVE_MODE", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
+        # Smart-money signal coverage today.
+        sm_today = _read_smart_money_today(workspace_root)
+        smart_money_markets_today = sum(1 for r in sm_today if int(r.get("traders_present") or 0) > 0)
         return jsonify(
             {
                 "provider": provider_model["provider"],
@@ -1281,6 +1442,7 @@ def create_dashboard_app(workspace_root: Path) -> Flask:
                 "paper_days_pct": paper_days["pct"],
                 "checklist_pass_count": pass_count,
                 "checklist_total": len(checks),
+                "smart_money_markets_today": smart_money_markets_today,
                 "uptime_seconds": round(time.time() - _PROCESS_START_TS, 2),
                 "uptime": _format_uptime(time.time() - _PROCESS_START_TS),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
