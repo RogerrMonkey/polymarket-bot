@@ -95,3 +95,78 @@ def test_normalize_funder_address_checksums_lowercase():
 def test_normalize_funder_address_rejects_invalid():
     with pytest.raises(RuntimeError, match="invalid or not checksummable"):
         auth._normalize_funder_address("not-a-real-address")
+
+
+# --- v0.9.2 preloaded API creds bypass ---
+
+
+def test_create_client_uses_preloaded_creds_when_present(monkeypatch):
+    """When all three POLYMARKET_API_* env vars are set, the client must
+    skip create_or_derive_api_creds entirely (which would 403 from
+    geo-blocked regions) and use the pasted credentials directly."""
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0x" + "cd" * 32)
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", "0x0000000000000000000000000000000000000002")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key")
+    monkeypatch.setenv("SIGNATURE_TYPE", "1")
+    monkeypatch.setenv("POLYMARKET_API_KEY", "preloaded-key")
+    monkeypatch.setenv("POLYMARKET_API_SECRET", "preloaded-secret")
+    monkeypatch.setenv("POLYMARKET_API_PASSPHRASE", "preloaded-pass")
+
+    derive_called = {"n": 0}
+
+    class _BlockedClobClient(_FakeClobClient):
+        def create_or_derive_api_creds(self):
+            derive_called["n"] += 1
+            raise RuntimeError("PolyApiException 403 Could not derive api key!")
+
+    fake_pkg = types.ModuleType("py_clob_client")
+    fake_client_mod = types.ModuleType("py_clob_client.client")
+    fake_client_mod.ClobClient = _BlockedClobClient
+    fake_types_mod = types.ModuleType("py_clob_client.clob_types")
+
+    class _ApiCreds:
+        def __init__(self, *, api_key, api_secret, api_passphrase):
+            self.api_key = api_key
+            self.api_secret = api_secret
+            self.api_passphrase = api_passphrase
+
+    fake_types_mod.ApiCreds = _ApiCreds
+
+    monkeypatch.setitem(sys.modules, "py_clob_client", fake_pkg)
+    monkeypatch.setitem(sys.modules, "py_clob_client.client", fake_client_mod)
+    monkeypatch.setitem(sys.modules, "py_clob_client.clob_types", fake_types_mod)
+
+    client = auth.create_client()
+    # derive endpoint must NOT have been called — preloaded creds win
+    assert derive_called["n"] == 0
+    assert isinstance(client._creds, _ApiCreds)
+    assert client._creds.api_key == "preloaded-key"
+
+
+def test_create_client_geoblock_error_message_helpful(monkeypatch):
+    """When derive fails with a 403, the surfaced error should explicitly
+    name the workaround (paste creds in .env)."""
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0x" + "ef" * 32)
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", "0x0000000000000000000000000000000000000003")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key")
+    monkeypatch.setenv("SIGNATURE_TYPE", "1")
+    monkeypatch.delenv("POLYMARKET_API_KEY", raising=False)
+    monkeypatch.delenv("POLYMARKET_API_SECRET", raising=False)
+    monkeypatch.delenv("POLYMARKET_API_PASSPHRASE", raising=False)
+
+    class _BlockedClobClient(_FakeClobClient):
+        def create_or_derive_api_creds(self):
+            raise RuntimeError("PolyApiException 403 Could not derive api key!")
+
+    fake_pkg = types.ModuleType("py_clob_client")
+    fake_client_mod = types.ModuleType("py_clob_client.client")
+    fake_client_mod.ClobClient = _BlockedClobClient
+
+    monkeypatch.setitem(sys.modules, "py_clob_client", fake_pkg)
+    monkeypatch.setitem(sys.modules, "py_clob_client.client", fake_client_mod)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        auth.create_client()
+    msg = str(exc_info.value)
+    assert "POLYMARKET_API_KEY" in msg
+    assert "POLYMARKET_API_PASSPHRASE" in msg

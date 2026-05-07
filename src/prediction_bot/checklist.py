@@ -171,6 +171,16 @@ def _check_balance_and_open_orders() -> list[ChecklistItem]:
         balance_payload = _call_balance(client)
         open_orders = _call_open_orders(client)
     except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if "403" in msg or "Could not derive" in msg:
+            hint = (
+                "clob_auth_geoblocked - paste POLYMARKET_API_KEY/SECRET/PASSPHRASE in .env "
+                "to bypass Cloudflare-blocked /auth endpoint"
+            )
+            return [
+                ChecklistItem("balance_usdc_gt_20", False, hint),
+                ChecklistItem("open_orders_empty", False, hint),
+            ]
         return [
             ChecklistItem("balance_usdc_gt_20", False, f"auth_call_failed:{exc}"),
             ChecklistItem("open_orders_empty", False, "auth_call_failed"),

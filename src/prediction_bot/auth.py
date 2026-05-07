@@ -85,6 +85,32 @@ def load_auth_settings() -> AuthSettings:
     )
 
 
+def _preloaded_api_creds() -> Any | None:
+    """Return ApiCreds from env vars if all three are set, else None.
+
+    The Polymarket CLOB API-key derivation endpoint is geo-blocked by
+    Cloudflare from some regions (notably India) even with WARP active.
+    The market-data endpoints stay reachable, so we can avoid the
+    derive call entirely if the operator already has credentials from
+    a prior browser session and pastes them into .env:
+
+        POLYMARKET_API_KEY=...
+        POLYMARKET_API_SECRET=...
+        POLYMARKET_API_PASSPHRASE=...
+    """
+    api_key = (os.getenv("POLYMARKET_API_KEY") or "").strip()
+    api_secret = (os.getenv("POLYMARKET_API_SECRET") or "").strip()
+    api_passphrase = (os.getenv("POLYMARKET_API_PASSPHRASE") or "").strip()
+    if not (api_key and api_secret and api_passphrase):
+        return None
+    try:
+        clob_types = importlib.import_module("py_clob_client.clob_types")
+        ApiCreds = getattr(clob_types, "ApiCreds")
+    except Exception:  # noqa: BLE001
+        return None
+    return ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
+
+
 def create_client() -> Any:
     settings = load_auth_settings()
 
@@ -114,7 +140,26 @@ def create_client() -> Any:
             funder=settings.funder_address,
         )
 
-    api_creds = client.create_or_derive_api_creds()
+    # Prefer pre-loaded creds when available — bypasses the Cloudflare-blocked
+    # /auth/api-key/create endpoint that returns 403 from geo-restricted IPs.
+    preloaded = _preloaded_api_creds()
+    if preloaded is not None:
+        client.set_api_creds(preloaded)
+        return client
+
+    try:
+        api_creds = client.create_or_derive_api_creds()
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if "403" in msg or "Could not derive" in msg:
+            raise RuntimeError(
+                "CLOB auth endpoint blocked (Cloudflare 403 / 'Could not derive api key!'). "
+                "This is typically a geo-restriction even with WARP. Workaround: create API "
+                "credentials once on polymarket.com (browser console or web app), then paste "
+                "them into .env as POLYMARKET_API_KEY / POLYMARKET_API_SECRET / "
+                "POLYMARKET_API_PASSPHRASE. The bot will use them directly without re-deriving."
+            ) from exc
+        raise
     client.set_api_creds(api_creds)
     return client
 

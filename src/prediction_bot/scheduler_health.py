@@ -112,15 +112,31 @@ def read_scheduler_health(workspace_root: Path, limit: int | None = None) -> lis
     return out
 
 
+_NON_SCHEDULER_FAILURE_REASONS = {
+    # Pre-watchlist-fix runs returned 0 candidates because the watchlist
+    # was misaligned with the live-markets endpoint. Not a scheduler bug;
+    # don't penalise the rate for those days.
+    "stale_watchlist",
+}
+
+
 def success_rate(workspace_root: Path, window: int = 14) -> tuple[float | None, int, int]:
     """Return (success_rate, ok_count, total) over last `window` cycle rows.
 
-    Heartbeat rows are excluded from the calculation — only end-of-cycle
-    rows (status: ok | missed | crashed) count toward the rate.
-    Returns (None, 0, 0) if there are no cycle entries at all.
+    Excluded from the calculation:
+      - heartbeat rows (intra-run progress markers, not run outcomes)
+      - rows whose `reason` is in `_NON_SCHEDULER_FAILURE_REASONS`
+        (infrastructure failures we've already root-caused and fixed,
+        not scheduler reliability problems)
+
+    Returns (None, 0, 0) if there are no qualifying cycle entries.
     """
     all_rows = read_scheduler_health(workspace_root)
-    cycle_rows = [r for r in all_rows if str(r.get("type") or "") != "heartbeat"]
+    cycle_rows = [
+        r for r in all_rows
+        if str(r.get("type") or "") != "heartbeat"
+        and str(r.get("reason") or "") not in _NON_SCHEDULER_FAILURE_REASONS
+    ]
     rows = cycle_rows[-window:] if window > 0 else cycle_rows
     total = len(rows)
     if total == 0:
