@@ -55,6 +55,7 @@ def record_cycle_health(
     *,
     warp_active: bool | None = None,
     warp_auto_connect_attempted: bool = False,
+    warp_drops: int = 0,
     status_override: str | None = None,
     reason_override: str | None = None,
 ) -> dict[str, Any]:
@@ -83,6 +84,7 @@ def record_cycle_health(
         "reason": reason,
         "warp_active": bool(warp_active),
         "warp_auto_connect_attempted": bool(warp_auto_connect_attempted),
+        "warp_drops": int(warp_drops),
         "analyses_today": analyses_today,
         "timestamp": _utc_now_iso(),
     }

@@ -51,6 +51,20 @@ def _last_run_summary(workspace_root: Path) -> str:
     )
 
 
+def _today_warp_drops(workspace_root: Path) -> tuple[int, int]:
+    """Return (warp_drops_today, total_cycles_today_proxy)."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    rows = [
+        r for r in read_scheduler_health(workspace_root)
+        if r.get("type") != "heartbeat" and str(r.get("date") or "") == today
+    ]
+    if not rows:
+        return 0, 0
+    drops = sum(int(r.get("warp_drops") or 0) for r in rows)
+    cycles = sum(int(r.get("analyses_today") or 0) for r in rows)
+    return drops, max(cycles, len(rows))
+
+
 def _paper_days(workspace_root: Path) -> int:
     """Distinct UTC dates present in data/analyses.jsonl."""
     path = workspace_root / "data" / "analyses.jsonl"
@@ -173,6 +187,7 @@ def collect_health(workspace_root: Path, db_path: str) -> dict[str, Any]:
         "live_mode": _env_bool("BOT_LIVE_MODE"),
         "today_analyses": _today_analyses_breakdown(workspace_root),
         "watchlist_status": _watchlist_status(workspace_root),
+        "warp_drops_today": _today_warp_drops(workspace_root),
     }
 
 
@@ -217,6 +232,9 @@ def print_health(data: dict[str, Any]) -> None:
     print(f"Bankroll (paper) : {bankroll}")
     today = data.get("today_analyses") or {"total": 0, "BUY": 0, "SELL": 0, "SKIP": 0}
     print(f"Today's analyses : {today.get('total', 0)} ({today.get('BUY', 0)} BUY, {today.get('SELL', 0)} SELL, {today.get('SKIP', 0)} SKIP)")
+    drops, cycles = data.get("warp_drops_today") or (0, 0)
+    if cycles:
+        print(f"WARP drops today : {drops} / {cycles} cycles")
     print(f"Watchlist status : {data.get('watchlist_status', 'unknown')}")
     print(f"Kill switch      : {ks}")
     print(f"Live mode        : {lm}")

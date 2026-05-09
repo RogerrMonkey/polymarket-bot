@@ -64,12 +64,17 @@ def test_collect_pre_live_checks_aggregates(monkeypatch, tmp_path: Path) -> None
         "_check_watchlist_fresh",
         lambda root: checklist.ChecklistItem("watchlist_fresh", True, "ok"),
     )
+    monkeypatch.setattr(
+        checklist,
+        "_check_warp_stability",
+        lambda root: checklist.ChecklistItem("warp_stability", True, "ok"),
+    )
     monkeypatch.setattr(checklist, "_check_access", lambda: [checklist.ChecklistItem("access", True, "ok")])
 
     ready, items = checklist.run_pre_live_checklist(workspace_root=tmp_path, db_path=str(tmp_path / "db.sqlite"))
 
     assert ready is True
-    assert len(items) == 17
+    assert len(items) == 18
 
 
 def test_check_wallet_address_valid_missing(monkeypatch) -> None:
@@ -230,3 +235,41 @@ def test_check_watchlist_fresh_stale(tmp_path) -> None:
     item = checklist._check_watchlist_fresh(tmp_path)
     assert item.passed is False
     assert "stale" in item.detail.lower()
+
+
+def test_check_warp_stability_no_runs_passes(tmp_path) -> None:
+    item = checklist._check_warp_stability(tmp_path)
+    assert item.passed is True
+    assert "no_runs_yet" in item.detail
+
+
+def test_check_warp_stability_low_drop_rate_passes(tmp_path) -> None:
+    import json
+    p = tmp_path / "data" / "scheduler_health.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"date": f"2026-05-{i:02d}", "status": "ok", "reason": "analyses_written",
+         "warp_drops": 1, "analyses_today": 30}
+        for i in range(1, 8)
+    ]
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    item = checklist._check_warp_stability(tmp_path)
+    # 7 drops / 210 cycles ≈ 3.3%, well under 20%
+    assert item.passed is True
+    assert "warp_drops=7" in item.detail
+
+
+def test_check_warp_stability_high_drop_rate_fails(tmp_path) -> None:
+    import json
+    p = tmp_path / "data" / "scheduler_health.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"date": f"2026-05-{i:02d}", "status": "ok", "reason": "analyses_written",
+         "warp_drops": 20, "analyses_today": 30}
+        for i in range(1, 8)
+    ]
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    item = checklist._check_warp_stability(tmp_path)
+    # 140 drops / 210 cycles ≈ 66%, well over 20%
+    assert item.passed is False
+    assert "WARP unstable" in item.detail

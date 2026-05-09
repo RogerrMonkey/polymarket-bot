@@ -24,6 +24,36 @@ from prediction_bot.storage.prediction_store import PredictionStore
 from prediction_bot.utils.network import check_warp_active
 
 
+_FILE_SINK_INSTALLED: bool = False
+
+
+def _ensure_file_logging(workspace_root: Path) -> None:
+    """Install a rotating loguru file sink the first time the loop runs.
+
+    Without this, logs go only to stderr and are lost when the scheduled
+    task finishes. For a 6-week unattended accumulation period we need
+    persistent logs to diagnose anything that goes wrong overnight.
+    """
+    global _FILE_SINK_INSTALLED
+    if _FILE_SINK_INSTALLED:
+        return
+    log_dir = workspace_root / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            log_dir / "bot_{time:YYYY-MM-DD}.log",
+            rotation="50 MB",
+            retention="30 days",
+            compression="zip",
+            level="INFO",
+            enqueue=True,  # safe under multiprocess + signal handlers
+        )
+        _FILE_SINK_INSTALLED = True
+    except Exception as exc:  # noqa: BLE001
+        # File logging is best-effort; never block the trading path.
+        logger.warning("file_logging_setup_failed error={}", exc)
+
+
 def _append_jsonl(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
@@ -190,6 +220,10 @@ def run_paper_loop(
     workspace_root: Path,
     dry_run: bool,
 ) -> int:
+    # Persistent log sink: critical for unattended runs where stderr
+    # is not captured by the Windows scheduled task.
+    _ensure_file_logging(workspace_root)
+
     # Env-level KILL_SWITCH is an operator panic button: abort before we even
     # spin up the executor so no side effects (order placement, cost, logs) occur.
     # File-level kill_switch in risk_config.json is enforced per-order in risk_engine.
@@ -197,6 +231,21 @@ def run_paper_loop(
     if kill_env in {"1", "true", "yes", "on"}:
         print("kill_switch_env_active=true paper-loop aborted before first cycle")
         return 0
+
+    # Operational warning: analyses.jsonl size ceiling. At ~110 entries/day
+    # this is dwarfed by typical limits, but log when it crosses 10MB so
+    # operators have advance notice before any disk-pressure event.
+    try:
+        analyses_path = workspace_root / "data" / "analyses.jsonl"
+        if analyses_path.exists():
+            size_mb = analyses_path.stat().st_size / (1024 * 1024)
+            if size_mb > 10.0:
+                logger.warning(
+                    "analyses_jsonl_large size={:.1f}MB - consider archiving old entries",
+                    size_mb,
+                )
+    except Exception:  # noqa: BLE001
+        pass
 
     # Startup WARP check + auto-connect. If WARP is inactive we attempt a
     # best-effort `warp-cli connect`, wait briefly, and re-check. Non-fatal:
@@ -255,6 +304,7 @@ def run_paper_loop(
         except Exception:  # noqa: BLE001
             continue
 
+    warp_drops_this_run = 0
     try:
         iteration = 0
         while True:
@@ -262,6 +312,42 @@ def run_paper_loop(
                 break
 
             iteration += 1
+
+            # Per-cycle WARP guard. Mid-run drops were producing stub-only
+            # cycles polluting analyses.jsonl with low-quality signals;
+            # skip the cycle entirely instead of letting the analyst fall
+            # through to stub on a dead network.
+            if not check_warp_active():
+                logger.warning(
+                    "warp_dropped cycle={} - attempting reconnect", iteration,
+                )
+                try:
+                    subprocess.run(
+                        ["warp-cli", "connect"],
+                        timeout=10, capture_output=True, text=True,
+                    )
+                    time.sleep(5)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("warp_reconnect_error error={}", exc)
+                if not check_warp_active():
+                    logger.warning(
+                        "warp_reconnect_failed cycle={} - skipping cycle (no stub fallback)",
+                        iteration,
+                    )
+                    warp_drops_this_run += 1
+                    _append_heartbeat(
+                        workspace_root,
+                        cycle=iteration,
+                        analyses_so_far=analyses_so_far,
+                    )
+                    if cycles > 0 and iteration >= cycles:
+                        break
+                    sleep_left = max(1, interval_seconds)
+                    while sleep_left > 0 and not stop_requested:
+                        time.sleep(1)
+                        sleep_left -= 1
+                    continue
+
             summary = _run_cycle(
                 config=config,
                 workspace_root=workspace_root,
@@ -306,6 +392,7 @@ def run_paper_loop(
                 workspace_root,
                 warp_active=warp_active,
                 warp_auto_connect_attempted=warp_auto_connect_attempted,
+                warp_drops=warp_drops_this_run,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("scheduler_health_write_failed error={}", exc)
@@ -343,6 +430,7 @@ def run_paper_loop(
             workspace_root,
             warp_active=warp_active,
             warp_auto_connect_attempted=warp_auto_connect_attempted,
+            warp_drops=warp_drops_this_run,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("scheduler_health_write_failed error={}", exc)

@@ -16,6 +16,7 @@ from prediction_bot.research.smart_money import (
     TopTrader,
     TraderPosition,
     apply_smart_money_modifier,
+    fetch_market_top_positions,
     fetch_smart_money_signal,
     fetch_top_traders,
     fetch_trader_position,
@@ -353,3 +354,95 @@ def test_apply_smart_money_medium_contradict_no_change() -> None:
     base = _FakeAnalysisResult(probability=0.65, decision="BUY", confidence="Medium", reasoning="r", edge=0.10)
     out = apply_smart_money_modifier(base, _signal("Medium", yes_prob=0.30, traders=2, total=600.0))
     assert out is base
+
+
+# --- fetch_market_top_positions (v0.9.5) -----------------------------------
+
+
+def test_fetch_market_top_positions_returns_holders_sorted_by_size() -> None:
+    """Pulls /trades?market=cid then /positions?user=X for each unique wallet,
+    returning qualifying holders sorted by size_usdc desc."""
+    market_cid = "0xmkt"
+
+    # Per-user position payload, keyed on the lowercase wallet
+    by_user: dict[str, list[dict]] = {
+        "0xa": [{"conditionId": market_cid, "outcome": "Yes", "outcomeIndex": 0,
+                 "size": 1000, "avgPrice": 0.50, "currentValue": 500.0}],
+        "0xb": [{"conditionId": market_cid, "outcome": "No", "outcomeIndex": 1,
+                 "size": 2000, "avgPrice": 0.50, "currentValue": 1200.0}],
+        "0xc": [{"conditionId": market_cid, "outcome": "Yes", "outcomeIndex": 0,
+                 "size": 30, "avgPrice": 0.40, "currentValue": 50.0}],  # below threshold
+    }
+
+    class _Http:
+        def __init__(self):
+            self.calls = []
+
+        def get_json(self, url, params=None):
+            self.calls.append((url, params))
+            params = params or {}
+            if "trades" in url:
+                # Three unique wallets, with one wallet repeating to exercise dedupe
+                return [
+                    {"proxyWallet": "0xA", "size": 1, "price": 0.5},
+                    {"proxyWallet": "0xa", "size": 1, "price": 0.5},  # dup
+                    {"proxyWallet": "0xB", "size": 1, "price": 0.5},
+                    {"proxyWallet": "0xC", "size": 1, "price": 0.5},
+                ]
+            user = (params.get("user") or "").lower()
+            return by_user.get(user, [])
+
+    http = _Http()
+    out = fetch_market_top_positions(market_cid, http=http, min_position_usdc=100.0)
+    addrs = [p.address for p in out]
+    sizes = [p.size_usdc for p in out]
+    assert addrs == ["0xb", "0xa"]   # 0xc filtered out (below threshold), sorted desc
+    assert sizes == [1200.0, 500.0]
+
+
+def test_fetch_market_top_positions_returns_empty_on_trades_failure() -> None:
+    class _Http:
+        def get_json(self, url, params=None):
+            raise RuntimeError("boom")
+
+    out = fetch_market_top_positions("0xmkt", http=_Http())
+    assert out == []
+
+
+def test_fetch_smart_money_signal_unions_global_and_market_paths(tmp_path: Path) -> None:
+    """The signal should pull both top-trader-first AND market-recent-trader
+    candidates, deduping by address. Synthetic trader from the market path
+    gets weight=0.5; pre-known top trader keeps its real weight."""
+    cid = "0xmkt"
+    by_user: dict[str, list[dict]] = {
+        "0xtop": [{"conditionId": cid, "outcome": "Yes", "outcomeIndex": 0,
+                   "size": 1000, "avgPrice": 0.5, "currentValue": 800.0}],
+        "0xmarketonly": [{"conditionId": cid, "outcome": "No", "outcomeIndex": 1,
+                          "size": 600, "avgPrice": 0.5, "currentValue": 300.0}],
+    }
+
+    class _Http:
+        def __init__(self):
+            self.calls = []
+
+        def get_json(self, url, params=None):
+            self.calls.append((url, params))
+            params = params or {}
+            if "trades" in url:
+                # Trades-in-market lookup returns the market-only wallet
+                # plus a duplicate of 0xtop (which should be deduped).
+                return [
+                    {"proxyWallet": "0xMarketOnly", "size": 1, "price": 0.5},
+                    {"proxyWallet": "0xTop", "size": 1, "price": 0.5},
+                ]
+            user = (params.get("user") or "").lower()
+            return by_user.get(user, [])
+
+    top_traders = [_trader("0xtop", weight=1.0)]
+    sig = fetch_smart_money_signal(
+        cid, top_traders, http=_Http(), log_path=tmp_path / "sm.jsonl",
+    )
+    # 2 distinct holders found: 0xtop (weight 1.0, $800 YES) + 0xmarketonly (weight 0.5, $300 NO)
+    assert sig.traders_present == 2
+    # YES weighted: 1.0*800=800;  NO weighted: 0.5*300=150;  prob ≈ 0.842
+    assert abs(sig.weighted_yes_prob - (800.0 / 950.0)) < 1e-3

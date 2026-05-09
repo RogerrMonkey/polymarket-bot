@@ -51,7 +51,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-SM_TOP_TRADERS_LIMIT = _env_int("SM_TOP_TRADERS_LIMIT", 20)
+SM_TOP_TRADERS_LIMIT = _env_int("SM_TOP_TRADERS_LIMIT", 50)
 # Lowered from 200 in v0.9.4: most Polymarket markets rarely have a single
 # $200+ position from any one wallet, so a $200 threshold filtered out 100%
 # of overlap on initial smoke. $100 still cuts pure-noise tails while letting
@@ -59,8 +59,9 @@ SM_TOP_TRADERS_LIMIT = _env_int("SM_TOP_TRADERS_LIMIT", 20)
 SM_MIN_POSITION_USDC = _env_float("SM_MIN_POSITION_USDC", 100.0)
 SM_CACHE_TTL_HOURS = _env_float("SM_CACHE_TTL_HOURS", 6.0)
 # /trades is hard-capped at 1000 rows per request server-side; we paginate
-# via offset to reach SM_TRADES_SAMPLE_SIZE.
-SM_TRADES_SAMPLE_SIZE = _env_int("SM_TRADES_SAMPLE_SIZE", 2000)
+# via offset to reach SM_TRADES_SAMPLE_SIZE. v0.9.5: bumped from 2000 → 5000
+# (5 paginated calls) to widen the trader pool and improve market overlap.
+SM_TRADES_SAMPLE_SIZE = _env_int("SM_TRADES_SAMPLE_SIZE", 5000)
 _TRADES_PAGE_SIZE = 1000
 
 
@@ -365,6 +366,75 @@ def fetch_trader_position(
     return None
 
 
+def fetch_market_top_positions(
+    market_id: str,
+    *,
+    http: HttpClient | None = None,
+    seen: set[tuple[str, str]] | None = None,
+    min_position_usdc: float = SM_MIN_POSITION_USDC,
+    trade_lookback: int = 100,
+) -> list[TraderPosition]:
+    """Find the largest current position-holders in a specific market.
+
+    The /positions endpoint requires a user address (no market-first index
+    is exposed publicly). To derive market-top-holders we:
+
+      1. Pull /trades?market={cid}&limit={trade_lookback} — public, returns
+         the most recent trades on this specific market and the proxyWallets
+         that placed them.
+      2. For each unique wallet, call /positions?user=X and filter to the
+         target conditionId (re-using fetch_trader_position).
+
+    Returns the qualifying TraderPosition list, sorted by size_usdc desc.
+    Never raises.
+    """
+    mkt_lc = (market_id or "").strip().lower()
+    if not mkt_lc:
+        return []
+    client = http if http is not None else HttpClient(timeout_seconds=10.0, user_agent="polymarket-bot/0.9.5")
+
+    try:
+        trades = client.get_json(
+            "https://data-api.polymarket.com/trades",
+            params={"market": market_id, "limit": str(int(trade_lookback))},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("smart_money_market_trades_failed mkt={} error={}", mkt_lc[:14], exc)
+        return []
+    if not isinstance(trades, list) or not trades:
+        return []
+
+    unique_wallets: list[str] = []
+    seen_local: set[str] = set()
+    for row in trades:
+        if not isinstance(row, dict):
+            continue
+        addr = str(row.get("proxyWallet") or "").lower()
+        if not addr or addr in seen_local:
+            continue
+        seen_local.add(addr)
+        unique_wallets.append(addr)
+
+    positions: list[TraderPosition] = []
+    for addr in unique_wallets:
+        pos = fetch_trader_position(
+            addr,
+            market_id,
+            http=client,
+            seen=seen,
+            min_position_usdc=min_position_usdc,
+        )
+        if pos is not None:
+            positions.append(pos)
+
+    positions.sort(key=lambda p: p.size_usdc, reverse=True)
+    logger.debug(
+        "smart_money_market_lookup market={} top_holders={}",
+        mkt_lc[:14], len(positions),
+    )
+    return positions
+
+
 # --- fetch_smart_money_signal ------------------------------------------------
 
 
@@ -396,6 +466,7 @@ def fetch_smart_money_signal(
     seen_local = seen if seen is not None else set()
 
     pairs: list[tuple[TopTrader, TraderPosition]] = []
+    matched_addresses: set[str] = set()
     for trader in top_traders:
         position = fetch_trader_position(
             trader.address,
@@ -406,6 +477,32 @@ def fetch_smart_money_signal(
         )
         if position is not None:
             pairs.append((trader, position))
+            matched_addresses.add(position.address)
+
+    # Second lookup path (v0.9.5): recent traders specifically active in
+    # THIS market. Catches large position-holders who weren't in the
+    # global top-50 by recent volume across all markets. Each one gets
+    # a default weight of 0.5 since we don't have their global ranking.
+    market_holders = fetch_market_top_positions(
+        market_id,
+        http=http,
+        seen=seen_local,
+        min_position_usdc=min_position_usdc,
+    )
+    for pos in market_holders:
+        if pos.address in matched_addresses:
+            continue
+        synthetic_trader = TopTrader(
+            address=pos.address,
+            rank=0,
+            pnl_usdc=0.0,
+            total_trades=1,
+            win_rate=0.0,
+            roi_pct=0.0,
+            weight=0.5,
+        )
+        pairs.append((synthetic_trader, pos))
+        matched_addresses.add(pos.address)
 
     yes_weight = sum(t.weight * p.size_usdc for t, p in pairs if p.side == "YES")
     no_weight = sum(t.weight * p.size_usdc for t, p in pairs if p.side == "NO")
@@ -535,6 +632,7 @@ __all__ = [
     "SmartMoneySignal",
     "fetch_top_traders",
     "fetch_trader_position",
+    "fetch_market_top_positions",
     "fetch_smart_money_signal",
     "apply_smart_money_modifier",
 ]

@@ -480,6 +480,44 @@ def _check_all_safety_checks_pass() -> ChecklistItem:
     )
 
 
+def _check_warp_stability(workspace_root: Path) -> ChecklistItem:
+    """PASS if warp_drops/cycles ratio < 20% over the last 7 cycle entries.
+
+    A WARP that drops mid-run causes wasted cycles and (pre-v0.9.5) stub
+    contamination of analyses.jsonl. This check exposes chronic instability
+    before it silently degrades validation data.
+    """
+    name = "warp_stability"
+    try:
+        from prediction_bot.scheduler_health import read_scheduler_health
+    except Exception as exc:  # noqa: BLE001
+        return ChecklistItem(name, False, f"import_failed:{exc}")
+
+    rows = [
+        r for r in read_scheduler_health(workspace_root)
+        if str(r.get("type") or "") != "heartbeat"
+    ]
+    rows = rows[-7:]
+    if not rows:
+        return ChecklistItem(name, True, "no_runs_yet — assume stable")
+
+    total_drops = sum(int(r.get("warp_drops") or 0) for r in rows)
+    # Use analyses_today as a coarse cycle proxy when warp_drops field is
+    # absent (older rows pre-v0.9.5 don't have the field).
+    cycles_proxy = sum(int(r.get("analyses_today") or 0) for r in rows)
+    cycle_count = max(cycles_proxy, len(rows))  # at minimum, one per run
+    rate = total_drops / cycle_count if cycle_count > 0 else 0.0
+    pct = round(rate * 100, 1)
+    passed = rate < 0.20
+    detail = f"warp_drops={total_drops} cycles={cycle_count} rate={pct}%"
+    if not passed:
+        detail = (
+            f"WARP unstable - {pct}% of cycles dropped in last 7 runs. "
+            f"Check WARP connection before scheduled run time."
+        )
+    return ChecklistItem(name, passed, detail)
+
+
 def _check_watchlist_fresh(workspace_root: Path) -> ChecklistItem:
     """PASS if watchlist.json was updated within the last 48 hours.
 
@@ -568,6 +606,7 @@ def collect_pre_live_checks(workspace_root: Path, db_path: str) -> list[Checklis
     checks.extend(_check_paper_gates(workspace_root, db_path))
     checks.append(_check_paper_loop_has_run_today(workspace_root))
     checks.append(_check_watchlist_fresh(workspace_root))
+    checks.append(_check_warp_stability(workspace_root))
     checks.append(_check_news_feed_has_sources(workspace_root))
     checks.append(_check_scheduled_job_registered())
     checks.append(_check_warp_cli_installed())
