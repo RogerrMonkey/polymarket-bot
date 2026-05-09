@@ -120,7 +120,7 @@ def test_run_resolve_outcomes_command(monkeypatch, tmp_path: Path) -> None:
         def __init__(self, **kwargs):  # noqa: ANN003
             pass
 
-        def settle_unresolved_predictions(self, store, limit):  # noqa: ANN001
+        def settle_unresolved_predictions(self, store, limit, force_all=False):  # noqa: ANN001
             return ResolutionRunReport(checked=1, resolved=1, applied=0, unresolved=0, errors=0, updates=[])
 
     monkeypatch.setattr(cli, "load_config", lambda: _Cfg())

@@ -35,7 +35,7 @@ class WatchlistManager:
             unique.append(val)
         self.watchlist_path.write_text(json.dumps(unique, indent=2), encoding="utf-8")
 
-    def refresh_watchlist(self, limit: int = 100) -> list[str]:
+    def refresh_watchlist(self, limit: int = 150) -> list[str]:
         """Pull the top-volume currently-open markets and rewrite watchlist.json.
 
         Uses Gamma's `closed=false` and `volumeNum`-descending ordering so

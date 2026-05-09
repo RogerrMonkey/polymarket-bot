@@ -52,9 +52,16 @@ def _env_float(name: str, default: float) -> float:
 
 
 SM_TOP_TRADERS_LIMIT = _env_int("SM_TOP_TRADERS_LIMIT", 20)
-SM_MIN_POSITION_USDC = _env_float("SM_MIN_POSITION_USDC", 200.0)
+# Lowered from 200 in v0.9.4: most Polymarket markets rarely have a single
+# $200+ position from any one wallet, so a $200 threshold filtered out 100%
+# of overlap on initial smoke. $100 still cuts pure-noise tails while letting
+# real conviction positions through.
+SM_MIN_POSITION_USDC = _env_float("SM_MIN_POSITION_USDC", 100.0)
 SM_CACHE_TTL_HOURS = _env_float("SM_CACHE_TTL_HOURS", 6.0)
-SM_TRADES_SAMPLE_SIZE = _env_int("SM_TRADES_SAMPLE_SIZE", 500)
+# /trades is hard-capped at 1000 rows per request server-side; we paginate
+# via offset to reach SM_TRADES_SAMPLE_SIZE.
+SM_TRADES_SAMPLE_SIZE = _env_int("SM_TRADES_SAMPLE_SIZE", 2000)
+_TRADES_PAGE_SIZE = 1000
 
 
 def _cache_path(workspace_root: Path | None = None) -> Path:
@@ -203,24 +210,37 @@ def fetch_top_traders(
         except Exception as exc:  # noqa: BLE001
             logger.debug("smart_money_cache_unreadable error={}", exc)
 
-    # 2. Live fetch via /trades
-    client = http if http is not None else HttpClient(timeout_seconds=10.0, user_agent="polymarket-bot/0.9.3")
-    try:
-        payload = client.get_json(
-            "https://data-api.polymarket.com/trades",
-            params={"limit": str(int(sample_size))},
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("smart_money_trades_fetch_failed error={}", exc)
-        return []
+    # 2. Live fetch via /trades — paginate by offset since the endpoint
+    #    hard-caps at 1000 rows per request.
+    client = http if http is not None else HttpClient(timeout_seconds=10.0, user_agent="polymarket-bot/0.9.4")
+    rows_collected: list[dict] = []
+    target = max(int(sample_size), _TRADES_PAGE_SIZE)
+    offset = 0
+    while len(rows_collected) < target:
+        try:
+            page = client.get_json(
+                "https://data-api.polymarket.com/trades",
+                params={
+                    "limit": str(_TRADES_PAGE_SIZE),
+                    "offset": str(offset),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("smart_money_trades_fetch_failed offset={} error={}", offset, exc)
+            break
+        if not isinstance(page, list) or not page:
+            break
+        rows_collected.extend(page)
+        if len(page) < _TRADES_PAGE_SIZE:
+            break  # last page reached
+        offset += _TRADES_PAGE_SIZE
 
-    if not isinstance(payload, list):
-        logger.warning("smart_money_trades_unexpected_shape type={}", type(payload).__name__)
+    if not rows_collected:
         return []
 
     # 3. Aggregate by proxyWallet
     by_wallet: dict[str, dict[str, float]] = {}
-    for row in payload:
+    for row in rows_collected:
         if not isinstance(row, dict):
             continue
         addr = str(row.get("proxyWallet") or "").lower()
@@ -272,8 +292,9 @@ def fetch_top_traders(
         logger.debug("smart_money_cache_write_failed error={}", exc)
 
     logger.info(
-        "smart_money: fetched {} top traders (top_volume=${:.0f}, cached=False)",
+        "smart_money: ranked {} unique traders from {} trades (top_volume=${:.0f}, cached=False)",
         len(traders),
+        len(rows_collected),
         traders[0].pnl_usdc if traders else 0.0,
     )
     return traders

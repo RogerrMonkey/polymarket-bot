@@ -59,12 +59,17 @@ def test_collect_pre_live_checks_aggregates(monkeypatch, tmp_path: Path) -> None
         "_check_warp_cli_installed",
         lambda: checklist.ChecklistItem("warp_cli_installed", True, "ok"),
     )
+    monkeypatch.setattr(
+        checklist,
+        "_check_watchlist_fresh",
+        lambda root: checklist.ChecklistItem("watchlist_fresh", True, "ok"),
+    )
     monkeypatch.setattr(checklist, "_check_access", lambda: [checklist.ChecklistItem("access", True, "ok")])
 
     ready, items = checklist.run_pre_live_checklist(workspace_root=tmp_path, db_path=str(tmp_path / "db.sqlite"))
 
     assert ready is True
-    assert len(items) == 16
+    assert len(items) == 17
 
 
 def test_check_wallet_address_valid_missing(monkeypatch) -> None:
@@ -199,3 +204,29 @@ def test_write_and_read_prelive_report(tmp_path: Path) -> None:
     assert payload["all_passed"] is False
     assert payload["passed_count"] == 1
     assert payload["failed_count"] == 1
+
+
+def test_check_watchlist_fresh_missing(tmp_path) -> None:
+    item = checklist._check_watchlist_fresh(tmp_path)
+    assert item.passed is False
+    assert "missing" in item.detail
+
+
+def test_check_watchlist_fresh_recent(tmp_path) -> None:
+    p = tmp_path / "watchlist.json"
+    p.write_text("[]", encoding="utf-8")
+    item = checklist._check_watchlist_fresh(tmp_path)
+    assert item.passed is True
+    assert "ago" in item.detail
+
+
+def test_check_watchlist_fresh_stale(tmp_path) -> None:
+    import os, time
+    p = tmp_path / "watchlist.json"
+    p.write_text("[]", encoding="utf-8")
+    # Backdate mtime by 72 hours
+    old = time.time() - 72 * 3600
+    os.utime(p, (old, old))
+    item = checklist._check_watchlist_fresh(tmp_path)
+    assert item.passed is False
+    assert "stale" in item.detail.lower()

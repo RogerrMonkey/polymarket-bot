@@ -319,6 +319,94 @@ def run_refresh_watchlist_command(limit: int) -> int:
     return 0
 
 
+def run_pnl_summary_command() -> int:
+    """Print a one-page paper P&L summary keyed off paper_pnl.jsonl + Brier."""
+    from prediction_bot.outcome_resolver import _read_resolved_market_ids
+    from prediction_bot.paper_pnl import PaperPnLTracker
+    from prediction_bot.storage.prediction_store import PredictionStore
+
+    root = Path(".").resolve()
+    config = load_config()
+
+    pnl = PaperPnLTracker(ledger_path=root / "data" / "paper_pnl.jsonl").summary()
+
+    # Trades file is the source of truth for total trade count; paper_pnl
+    # tracks RESOLVED legs so totals can lag.
+    trades_path = root / "data" / "trades.jsonl"
+    total_trades = 0
+    if trades_path.exists():
+        for line in trades_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.strip():
+                total_trades += 1
+
+    resolved = pnl.get("total_trades", 0)
+    pending = max(0, total_trades - resolved)
+
+    win_rate = pnl.get("win_rate")
+    win_rate_str = f"{win_rate:.0%}" if isinstance(win_rate, (int, float)) else "n/a"
+    winners = pnl.get("winning_trades", 0)
+    total_pnl = float(pnl.get("total_pnl_usdc") or 0.0)
+    best = pnl.get("best_trade")
+    worst = pnl.get("worst_trade")
+    starting = float(pnl.get("starting_bankroll") or 100.0)
+    current = float(pnl.get("current_bankroll") or starting)
+    roi_pct = float(pnl.get("roi_pct") or 0.0)
+
+    try:
+        store = PredictionStore(config.storage.db_path)
+        metrics = store.brier_metrics()
+        brier_score = metrics.brier_score
+        brier_n = metrics.sample_count
+    except Exception:  # noqa: BLE001
+        brier_score = None
+        brier_n = 0
+    resolved_ids = len(_read_resolved_market_ids(root))
+    effective_n = max(brier_n, resolved_ids)
+
+    if effective_n < 20:
+        status = "INSUFFICIENT DATA"
+    elif (
+        effective_n >= 30
+        and brier_score is not None and brier_score < 0.20
+        and isinstance(win_rate, (int, float)) and win_rate > 0.55
+    ):
+        status = "STRONG"
+    elif (
+        brier_score is not None and brier_score < 0.22
+        and isinstance(win_rate, (int, float)) and win_rate > 0.52
+    ):
+        status = "GOOD"
+    elif (
+        brier_score is not None and brier_score < 0.25
+        and isinstance(win_rate, (int, float)) and win_rate > 0.50
+    ):
+        status = "PROMISING"
+    else:
+        status = "WEAK"
+
+    print("Paper P&L Summary")
+    print("-" * 33)
+    print(f"Total trades:      {total_trades}")
+    print(f"Resolved:          {resolved}")
+    print(f"Pending:           {pending}")
+    print("-" * 33)
+    print(f"Win rate:          {win_rate_str}{f' ({winners}/{resolved} resolved)' if resolved else ''}")
+    print(f"Total P&L:         {total_pnl:+.2f}")
+    if best is not None:
+        print(f"Best trade:        {float(best):+.2f}")
+    if worst is not None:
+        print(f"Worst trade:       {float(worst):+.2f}")
+    print(f"Bankroll:          ${starting:.2f} -> ${current:.2f}")
+    print(f"ROI:               {roi_pct:+.1f}%")
+    print("-" * 33)
+    if brier_score is not None:
+        print(f"Brier score:       {brier_score:.3f} (n={brier_n} predictions, {resolved_ids} markets)")
+    else:
+        print(f"Brier score:       unavailable (n={brier_n})")
+    print(f"Status: {status}")
+    return 0
+
+
 def run_news_check_command(limit: int) -> int:
     """Smoke test the GDELT + RSS news pipeline; print the top N headlines."""
     from prediction_bot.research.news_feed import (
@@ -400,7 +488,13 @@ def run_synthetic_replay_command(
     return 0
 
 
-def run_resolve_outcomes_command(limit: int, dry_run: bool, stub_mode: bool, stub_path: str | None) -> int:
+def run_resolve_outcomes_command(
+    limit: int,
+    dry_run: bool,
+    stub_mode: bool,
+    stub_path: str | None,
+    force_all: bool = False,
+) -> int:
     root = Path(".").resolve()
     config = load_config()
     store = PredictionStore(config.storage.db_path)
@@ -416,8 +510,13 @@ def run_resolve_outcomes_command(limit: int, dry_run: bool, stub_mode: bool, stu
         stub_mode=stub_mode,
         stub_path=Path(stub_path) if stub_path else None,
     )
-    report = resolver.settle_unresolved_predictions(store=store, limit=limit)
+    report = resolver.settle_unresolved_predictions(store=store, limit=limit, force_all=force_all)
     report_path = write_resolution_report(workspace_root=root, report=report)
+    if force_all:
+        print(
+            f"resolver_sweep: checked={report.checked} resolved={report.resolved} "
+            f"applied={report.applied} pending={report.unresolved} errors={report.errors}"
+        )
     print_resolution_report(report)
     print(f"report_path={report_path}")
     print(f"db_path={config.storage.db_path}")
@@ -488,6 +587,11 @@ def build_parser() -> argparse.ArgumentParser:
     resolver.add_argument("--stub-mode", action="store_true", default=True)
     resolver.add_argument("--no-stub-mode", dest="stub_mode", action="store_false")
     resolver.add_argument("--stub-path", default=None)
+    resolver.add_argument(
+        "--force-all",
+        action="store_true",
+        help="Bypass the resolved_markets.jsonl skip-list — re-check every unresolved prediction against Gamma",
+    )
 
     dash = sub.add_parser("serve-dashboard", help="Run local operations dashboard")
     dash.add_argument("--host", default="127.0.0.1")
@@ -504,8 +608,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("verify-auth", help="Run authenticated CLOB credential checks")
     sub.add_parser("health-check", help="Print a one-page system health snapshot")
     sub.add_parser("live-readiness", help="Evaluate live-mode readiness gates")
+    sub.add_parser("pnl-summary", help="Print paper P&L summary with status verdict")
     refresh = sub.add_parser("refresh-watchlist", help="Refresh watchlist.json with top-volume open Polymarket markets")
-    refresh.add_argument("--limit", type=int, default=50)
+    refresh.add_argument("--limit", type=int, default=150)
 
     news = sub.add_parser("news-check", help="Smoke test the news pipeline; print top headlines")
     news.add_argument("--limit", type=int, default=3)
@@ -553,6 +658,7 @@ def main() -> int:
             dry_run=args.dry_run,
             stub_mode=args.stub_mode,
             stub_path=args.stub_path,
+            force_all=getattr(args, "force_all", False),
         )
     if args.command == "serve-dashboard":
         return run_dashboard_command(host=args.host, port=args.port)
@@ -584,6 +690,8 @@ def main() -> int:
         )
     if args.command == "refresh-watchlist":
         return run_refresh_watchlist_command(limit=args.limit)
+    if args.command == "pnl-summary":
+        return run_pnl_summary_command()
 
     parser.error("Unknown command")
     return 2

@@ -21,7 +21,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from datetime import timedelta
+
 from prediction_bot.health_check import _brier, _env_bool, _paper_days
+from prediction_bot.outcome_resolver import _read_resolved_market_ids
 from prediction_bot.paper_pnl import PaperPnLTracker
 
 
@@ -109,10 +112,80 @@ def _estimate_ready_date(paper_days: int) -> str:
     if remaining <= 0:
         return "today (paper-days threshold met; other gates may still be pending)"
     today = datetime.now(timezone.utc).date()
-    from datetime import timedelta
 
     eta = today + timedelta(days=remaining)
     return f"~{eta.isoformat()} (est. based on paper-day accumulation rate)"
+
+
+def _days_since_first_analysis(workspace_root: Path) -> float:
+    """Days elapsed between the earliest analyses.jsonl entry and now."""
+    path = workspace_root / "data" / "analyses.jsonl"
+    if not path.exists():
+        return 0.0
+    earliest: datetime | None = None
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        ts = str(row.get("timestamp") or "")
+        if not ts:
+            continue
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if earliest is None or dt < earliest:
+            earliest = dt
+    if earliest is None:
+        return 0.0
+    elapsed = (datetime.now(timezone.utc) - earliest).total_seconds() / 86400.0
+    return max(0.0, elapsed)
+
+
+def _eta_paper_days(workspace_root: Path) -> tuple[str, float | None]:
+    """Estimate ETA for the 30-day paper gate based on observed accumulation rate."""
+    days = _paper_days(workspace_root)
+    if days >= 30:
+        return ("met", 0.0)
+    elapsed = _days_since_first_analysis(workspace_root)
+    if elapsed <= 0 or days <= 0:
+        # No history yet; default to one paper day per calendar day.
+        rate = 1.0
+    else:
+        rate = days / elapsed
+    rate = max(rate, 0.05)  # guard against pathologically low rates
+    days_remaining = (30 - days) / rate
+    eta_date = (datetime.now(timezone.utc) + timedelta(days=days_remaining)).date().isoformat()
+    return (eta_date, rate)
+
+
+def _eta_brier(workspace_root: Path, db_path: str) -> tuple[str, float | None, int]:
+    """Estimate ETA for n>=20 resolved markets based on resolution rate."""
+    _score, n = _brier(db_path)
+    resolved_count = len(_read_resolved_market_ids(workspace_root))
+    # Use the larger of the two — predictions store may lag the markets file.
+    effective_n = max(n, resolved_count)
+    if effective_n >= 20:
+        return ("met", None, effective_n)
+    elapsed = _days_since_first_analysis(workspace_root)
+    if elapsed > 0 and effective_n > 0:
+        rate_per_day = effective_n / elapsed
+    else:
+        # No resolutions yet — Polymarket markets typically settle ~30 days
+        # out, so assume that as a coarse upper bound.
+        rate_per_day = 1.0 / 30.0
+    rate_per_day = max(rate_per_day, 0.01)  # avoid divide-by-near-zero
+    days_remaining = (20 - effective_n) / rate_per_day
+    eta_date = (datetime.now(timezone.utc) + timedelta(days=days_remaining)).date().isoformat()
+    return (eta_date, rate_per_day, effective_n)
 
 
 def collect_readiness(workspace_root: Path, db_path: str) -> list[ReadinessGate]:
@@ -126,24 +199,63 @@ def collect_readiness(workspace_root: Path, db_path: str) -> list[ReadinessGate]
     ]
 
 
-def print_readiness(workspace_root: Path, gates: list[ReadinessGate]) -> None:
+def print_readiness(workspace_root: Path, gates: list[ReadinessGate], db_path: str) -> None:
+    """Print PASS/FAIL gates with per-gate ETA hints under the failing ones.
+
+    Bottleneck = max(paper_eta, brier_eta) + 3-day buffer.
+    """
+    paper_eta, paper_rate = _eta_paper_days(workspace_root)
+    brier_eta, brier_rate, brier_n = _eta_brier(workspace_root, db_path)
+
     print(f"Live Readiness Report - {_utc_today()}")
-    print("====================================")
+    print("=" * 56)
     for g in gates:
         status = "PASS" if g.passed else "FAIL"
         print(f"[{status}] {g.name}: {g.detail}")
-    print("====================================")
+        if not g.passed:
+            if g.name == "Paper days: >= 30":
+                if paper_eta == "met":
+                    print("       (threshold met)")
+                else:
+                    rate_str = f"{paper_rate:.2f}" if paper_rate is not None else "?"
+                    print(f"       Rate: {rate_str} days/day -> ETA: ~{paper_eta}")
+            elif g.name == "Brier score < 0.22 (n>=20)":
+                if brier_eta == "met":
+                    print("       (n>=20 reached; check current score)")
+                else:
+                    rate_str = f"~{brier_rate:.2f}/day" if brier_rate is not None else "?"
+                    print(f"       Resolution rate: {rate_str} -> ETA: ~{brier_eta}")
+            elif g.name == "Win rate > 52% (n>=10)":
+                if brier_n < 5:
+                    print("       Insufficient data - need 10 resolved approved trades")
+                else:
+                    print(f"       ETA: ~{brier_eta} (gated by market resolutions)")
+    print("=" * 56)
     failing = [g for g in gates if not g.passed]
     if not failing:
         print("VERDICT: READY - all gates passing. Follow docs/LIVE_MODE_RUNBOOK.md.")
+        return
+
+    print(f"VERDICT: NOT READY - {len(failing)} gates failing")
+    # Compute overall ETA = max(paper, brier) + 3-day buffer.
+    candidate_dates: list[str] = [d for d in (paper_eta, brier_eta) if d not in ("met", None)]
+    if candidate_dates:
+        latest = max(candidate_dates)
+        try:
+            latest_dt = datetime.fromisoformat(latest).replace(tzinfo=timezone.utc)
+            overall_eta = (latest_dt + timedelta(days=3)).date().isoformat()
+        except ValueError:
+            overall_eta = latest
+        bottleneck = "market resolution rate" if brier_eta != "met" and brier_eta == latest else "paper-day accumulation"
+        print(f"Estimated ready: ~{overall_eta}")
+        print(f"(bottleneck: {bottleneck})")
     else:
-        print(f"VERDICT: NOT READY - {len(failing)} gates failing")
         print(f"Earliest ready: {_estimate_ready_date(_paper_days(workspace_root))}")
 
 
 def run_live_readiness_command(workspace_root: Path, db_path: str) -> int:
     gates = collect_readiness(workspace_root=workspace_root, db_path=db_path)
-    print_readiness(workspace_root, gates)
+    print_readiness(workspace_root, gates, db_path=db_path)
     return 0 if all(g.passed for g in gates) else 1
 
 

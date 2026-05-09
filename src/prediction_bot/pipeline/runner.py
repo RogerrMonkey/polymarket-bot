@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -124,6 +125,27 @@ def execute_scan_run(
     ingestion = ingestor.run(limit_per_venue=limit_per_venue)
 
     watchlist_manager = WatchlistManager(http=http, watchlist_path=root / "watchlist.json")
+    # Age-based auto-refresh: a partially stale watchlist degrades signal
+    # quality silently (keeps a few markets but ages out top-volume entrants).
+    # 24h is short enough that v0.9.3's silent rot can't recur, long enough
+    # to avoid hitting Gamma every paper-loop run during the day.
+    watchlist_path = root / "watchlist.json"
+    if watchlist_path.exists():
+        try:
+            age_hours = (time.time() - watchlist_path.stat().st_mtime) / 3600.0
+        except OSError:
+            age_hours = 0.0
+        if age_hours > 24.0:
+            from loguru import logger as _wl_logger
+
+            _wl_logger.info(
+                "watchlist_stale age={:.1f}h - auto-refreshing", age_hours,
+            )
+            try:
+                watchlist_manager.refresh_watchlist(limit=150)
+            except Exception as exc:  # noqa: BLE001
+                ingestion.errors.append(f"watchlist_age_refresh_failed:{exc}")
+
     watchlist = watchlist_manager.load_watchlist()
     if not watchlist:
         try:
@@ -148,7 +170,7 @@ def execute_scan_run(
         # against Gamma's current top-volume open markets and re-apply.
         if original_count > 0 and not ingestion.snapshots:
             try:
-                fresh = watchlist_manager.refresh_watchlist(limit=100)
+                fresh = watchlist_manager.refresh_watchlist(limit=150)
                 if fresh:
                     ingestion.errors.append(
                         f"watchlist_auto_refreshed:stale_dropped_all old_size={len(watchlist)} new_size={len(fresh)}"
@@ -171,6 +193,8 @@ def execute_scan_run(
     # then one /positions fetch per candidate to see if any of them hold a
     # qualifying position. Failures are logged and never crash the pipeline.
     smart_money_seen: set[tuple[str, str]] = set()
+    sm_markets_probed = 0
+    sm_positions_found = 0
     if candidates:
         try:
             top_traders = fetch_top_traders(http=http, workspace_root=root)
@@ -191,8 +215,18 @@ def execute_scan_run(
                     workspace_root=root,
                     seen=smart_money_seen,
                 )
+                sm_markets_probed += 1
+                if cand.smart_money is not None and getattr(cand.smart_money, "traders_present", 0) > 0:
+                    sm_positions_found += 1
             except Exception as exc:  # noqa: BLE001
                 ingestion.errors.append(f"smart_money_signal_failed:{cand.snapshot.market_id}:{exc}")
+        if top_traders:
+            from loguru import logger as _sm_logger  # local import to avoid widening top-of-file deps
+
+            _sm_logger.info(
+                "smart_money_coverage markets={} traders_checked={} positions_found={}",
+                sm_markets_probed, len(top_traders), sm_positions_found,
+            )
 
     research_signals: dict[str, ResearchSignal] = {}
     if config.research.enabled and candidates:

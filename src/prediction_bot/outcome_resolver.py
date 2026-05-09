@@ -295,11 +295,22 @@ class OutcomeResolver:
             detail="market_not_resolved",
         )
 
-    def settle_unresolved_predictions(self, store: PredictionStore, limit: int = 200) -> ResolutionRunReport:
+    def settle_unresolved_predictions(
+        self,
+        store: PredictionStore,
+        limit: int = 200,
+        force_all: bool = False,
+    ) -> ResolutionRunReport:
+        """Walk unresolved predictions and ask Gamma if each has settled.
+
+        force_all=True bypasses the resolved_markets.jsonl skip-list, useful
+        as a diagnostic sweep when you suspect markets resolved early on
+        Polymarket but the local skip-list short-circuited future re-checks.
+        """
         updates: list[ResolutionUpdate] = []
         errors = 0
 
-        already_resolved = _read_resolved_market_ids(self.workspace_root)
+        already_resolved = set() if force_all else _read_resolved_market_ids(self.workspace_root)
         rows = store.unresolved_predictions(limit=limit)
         checked = len(rows)
 
@@ -308,7 +319,7 @@ class OutcomeResolver:
             market_id = str(row["market_id"])
 
             # Skip markets already resolved in resolved_markets.jsonl to avoid
-            # redundant Gamma API calls across daily runs.
+            # redundant Gamma API calls across daily runs (unless force_all).
             if market_id in already_resolved:
                 continue
 

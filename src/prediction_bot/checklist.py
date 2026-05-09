@@ -480,6 +480,31 @@ def _check_all_safety_checks_pass() -> ChecklistItem:
     )
 
 
+def _check_watchlist_fresh(workspace_root: Path) -> ChecklistItem:
+    """PASS if watchlist.json was updated within the last 48 hours.
+
+    A stale watchlist degrades signal quality silently — paper-loop
+    runner will auto-refresh on next run when age > 24h, so a FAIL
+    here just tells the operator the next run will rotate it.
+    """
+    name = "watchlist_fresh"
+    path = workspace_root / "watchlist.json"
+    if not path.exists():
+        return ChecklistItem(name, False, "watchlist.json missing — run `refresh-watchlist`")
+    try:
+        import time as _t
+
+        age_hours = (_t.time() - path.stat().st_mtime) / 3600.0
+    except OSError as exc:
+        return ChecklistItem(name, False, f"stat_error:{exc}")
+    if age_hours <= 48.0:
+        return ChecklistItem(name, True, f"updated {age_hours:.1f}h ago")
+    return ChecklistItem(
+        name, False,
+        f"Watchlist stale ({age_hours:.1f}h) — will auto-refresh on next paper-loop run",
+    )
+
+
 def _check_warp_cli_installed() -> ChecklistItem:
     """PASS if `warp-cli --version` exits 0.
 
@@ -542,6 +567,7 @@ def collect_pre_live_checks(workspace_root: Path, db_path: str) -> list[Checklis
     checks.extend(_check_risk_config(workspace_root))
     checks.extend(_check_paper_gates(workspace_root, db_path))
     checks.append(_check_paper_loop_has_run_today(workspace_root))
+    checks.append(_check_watchlist_fresh(workspace_root))
     checks.append(_check_news_feed_has_sources(workspace_root))
     checks.append(_check_scheduled_job_registered())
     checks.append(_check_warp_cli_installed())

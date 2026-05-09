@@ -102,7 +102,9 @@ def test_readiness_returns_nonzero_exit_when_failing(tmp_path: Path, monkeypatch
     assert rc == 1
     out = capsys.readouterr().out
     assert "VERDICT: NOT READY" in out
-    assert "Earliest ready" in out
+    # v0.9.4 wording: "Estimated ready: ~YYYY-MM-DD" with bottleneck note,
+    # falls back to "Earliest ready: ..." when no per-gate ETA can be computed.
+    assert ("Estimated ready" in out) or ("Earliest ready" in out)
 
 
 def test_build_readiness_payload_shape(tmp_path: Path, monkeypatch) -> None:
