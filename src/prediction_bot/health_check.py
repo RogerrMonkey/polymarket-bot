@@ -29,7 +29,7 @@ def _utc_now_iso() -> str:
 def _analyst_label() -> str:
     """Return a short "provider (model)" string for the head of the chain."""
     try:
-        from prediction_bot.claude_analyst import build_provider_chain
+        from prediction_bot.llm_analyst import build_provider_chain
 
         chain = build_provider_chain()
         if not chain:

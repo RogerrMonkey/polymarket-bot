@@ -105,7 +105,7 @@ def _check_polymarket_envs() -> list[ChecklistItem]:
 def _check_analyst_provider_resolved() -> ChecklistItem:
     """Pass if the head of the provider chain is something other than the deterministic stub."""
     try:
-        from prediction_bot.claude_analyst import StubProvider, build_provider_chain
+        from prediction_bot.llm_analyst import StubProvider, build_provider_chain
     except Exception as exc:  # noqa: BLE001
         return ChecklistItem("analyst_provider_resolved", False, f"import_failed:{exc}")
 

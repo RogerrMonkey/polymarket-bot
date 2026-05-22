@@ -1,8 +1,8 @@
 # --- Secrets / local environment ----------------------------------
-# .env.example currently contains a live key (rotate + sanitize before
-# tracking it). Until then both .env and .env.example stay out of git.
+#  currently contains a live key (rotate + sanitize before
+# tracking it). Until then both .env and  stay out of git.
 .env
-.env.example
+
 .env.local
 .env.*.local
 *.pem
@@ -57,3 +57,10 @@ scripts/dev/
 Thumbs.db
 desktop.ini
 .claude/worktrees/
+
+
+# --- Agent files ---
+.claude/
+skills/
+.agents/
+claude.md

@@ -324,7 +324,7 @@ def _validate_and_normalise(
 
 @dataclass
 class ProviderResponse:
-    """Normalized provider output passed back to ClaudeAnalyst."""
+    """Normalized provider output passed back to LLMAnalyst."""
 
     tool_input: dict[str, Any] | None
     input_tokens: int = 0
@@ -465,139 +465,6 @@ class AnalystProvider(Protocol):
     def call(self, system_prompt: str, user_prompt: str) -> ProviderResponse: ...
 
 
-class AnthropicProvider:
-    name = "anthropic"
-
-    def __init__(self, api_key: str, model: str) -> None:
-        self.api_key = api_key
-        self.model = model
-        self._client: Any | None = None
-
-    def _get_client(self) -> Any:
-        if self._client is None:
-            module = importlib.import_module("anthropic")
-            self._client = module.Anthropic(api_key=self.api_key)
-        return self._client
-
-    def call(self, system_prompt: str, user_prompt: str) -> ProviderResponse:
-        client = self._get_client()
-        response = client.messages.create(
-            model=self.model,
-            max_tokens=350,
-            system=[
-                {
-                    "type": "text",
-                    "text": system_prompt,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": user_prompt,
-                            "cache_control": {"type": "ephemeral"},
-                        }
-                    ],
-                }
-            ],
-            tools=[ANSWER_TOOL_SCHEMA],
-        )
-
-        usage = getattr(response, "usage", None)
-        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
-        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
-
-        tool_input: dict[str, Any] | None = None
-        content = getattr(response, "content", None)
-        if isinstance(content, list):
-            for block in content:
-                if getattr(block, "type", None) == "tool_use" and getattr(block, "name", None) == "answer":
-                    candidate = getattr(block, "input", None)
-                    if isinstance(candidate, dict):
-                        tool_input = candidate
-                        break
-
-        return ProviderResponse(
-            tool_input=tool_input,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost_usd=estimate_cost(input_tokens, output_tokens),
-        )
-
-
-def _openai_tool_schema() -> dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": ANSWER_TOOL_SCHEMA["name"],
-            "description": ANSWER_TOOL_SCHEMA["description"],
-            "parameters": ANSWER_TOOL_SCHEMA["input_schema"],
-        },
-    }
-
-
-_THINK_RE = re.compile(r"<think\b[^>]*>(.*?)</think>", re.DOTALL | re.IGNORECASE)
-
-
-def _strip_thinking(text: str) -> tuple[str, str]:
-    """Strip a leading <think>...</think> block (DeepSeek R1 style).
-
-    Returns (stripped_content, captured_thinking). Both default to empty
-    strings if the input is empty.
-    """
-    if not text:
-        return "", ""
-    match = _THINK_RE.search(text)
-    if not match:
-        return text, ""
-    thinking = match.group(1).strip()
-    stripped = (text[: match.start()] + text[match.end():]).strip()
-    return stripped, thinking
-
-
-def _extract_content(message: Any) -> tuple[str, str]:
-    """Pull (content, thinking) out of a chat-completion message.
-
-    Handles two reasoning-model conventions:
-
-      1. Kimi K2 / Qwen3-thinking style: a separate `reasoning_content`
-         attribute carries the chain-of-thought; `content` carries only
-         the final answer.
-      2. DeepSeek R1 style: thinking is embedded in `content` inside
-         <think>...</think> tags and must be stripped.
-
-    For non-reasoning models both return values are derived from
-    `content` directly with thinking == "".
-    """
-    if message is None:
-        return "", ""
-    raw_content = getattr(message, "content", None) or ""
-    rc = getattr(message, "reasoning_content", None)
-    if isinstance(rc, str) and rc.strip():
-        return raw_content.strip(), rc.strip()
-    cleaned, thinking = _strip_thinking(raw_content)
-    return cleaned, thinking
-
-
-def _looks_like_auth_error(exc: Exception) -> bool:
-    msg = (str(exc) or "").lower()
-    if any(needle in msg for needle in ("401", "403", "unauthorized", "invalid api key", "authentication")):
-        return True
-    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-    return status in {401, 403}
-
-
-def _looks_like_rate_limit(exc: Exception) -> bool:
-    msg = (str(exc) or "").lower()
-    if "429" in msg or "rate" in msg and "limit" in msg:
-        return True
-    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-    return status == 429
-
-
 class NvidiaProvider:
     """NVIDIA NIM provider, OpenAI-compatible API at integrate.api.nvidia.com.
 
@@ -722,128 +589,6 @@ class NvidiaProvider:
         )
 
 
-class GroqProvider:
-    name = "groq"
-    base_url = "https://api.groq.com/openai/v1"
-
-    def __init__(self, api_key: str, model: str) -> None:
-        self.api_key = api_key
-        self.model = model
-        self._client: Any | None = None
-
-    def _get_client(self) -> Any:
-        if self._client is None:
-            module = importlib.import_module("openai")
-            self._client = module.OpenAI(api_key=self.api_key, base_url=self.base_url)
-        return self._client
-
-    def call(self, system_prompt: str, user_prompt: str) -> ProviderResponse:
-        client = self._get_client()
-        response = client.chat.completions.create(
-            model=self.model,
-            max_tokens=400,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            tools=[_openai_tool_schema()],
-            tool_choice={"type": "function", "function": {"name": "answer"}},
-        )
-
-        usage = getattr(response, "usage", None)
-        input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-        output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
-
-        tool_input: dict[str, Any] | None = None
-        choices = getattr(response, "choices", None) or []
-        if choices:
-            message = getattr(choices[0], "message", None)
-            tool_calls = getattr(message, "tool_calls", None) or []
-            for call in tool_calls:
-                fn = getattr(call, "function", None)
-                if fn is None or getattr(fn, "name", None) != "answer":
-                    continue
-                args_raw = getattr(fn, "arguments", None)
-                if isinstance(args_raw, str):
-                    try:
-                        parsed = json.loads(args_raw)
-                    except (TypeError, ValueError):
-                        parsed = None
-                    if isinstance(parsed, dict):
-                        tool_input = parsed
-                        break
-                elif isinstance(args_raw, dict):
-                    tool_input = args_raw
-                    break
-
-        return ProviderResponse(
-            tool_input=tool_input,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost_usd=0.0,  # Groq free tier; no per-call cost tracked
-        )
-
-
-class OllamaProvider:
-    name = "ollama"
-
-    def __init__(self, base_url: str, model: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-
-    def call(self, system_prompt: str, user_prompt: str) -> ProviderResponse:
-        import asyncio
-
-        return asyncio.run(self._call_async(system_prompt, user_prompt))
-
-    async def _call_async(self, system_prompt: str, user_prompt: str) -> ProviderResponse:
-        aiohttp = importlib.import_module("aiohttp")
-
-        schema_hint = (
-            "Respond with a JSON object using this exact shape: "
-            '{"probability": <0..1>, "decision": "YES"|"NO"|"SKIP", '
-            '"confidence": "Low"|"Medium"|"High", "reasoning": "<=500 chars", '
-            '"data_sources_used": ["..."]}'
-        )
-
-        payload = {
-            "model": self.model,
-            "stream": False,
-            "format": "json",
-            "messages": [
-                {"role": "system", "content": f"{system_prompt}\n\n{schema_hint}"},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{self.base_url}/api/chat", json=payload) as response:
-                response.raise_for_status()
-                body = await response.json()
-
-        message = body.get("message") or {}
-        content_text = message.get("content") or ""
-        tool_input: dict[str, Any] | None = None
-        if isinstance(content_text, str) and content_text.strip():
-            try:
-                parsed = json.loads(content_text)
-            except (TypeError, ValueError):
-                parsed = None
-            if isinstance(parsed, dict):
-                tool_input = parsed
-
-        input_tokens = int(body.get("prompt_eval_count") or 0)
-        output_tokens = int(body.get("eval_count") or 0)
-
-        return ProviderResponse(
-            tool_input=tool_input,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost_usd=0.0,
-        )
-
-
 class StubProvider:
     """Deterministic last-resort provider. Always SKIP at Low confidence."""
 
@@ -877,31 +622,11 @@ def build_provider_chain(
     nvidia_model: str | None = None,
     nvidia_temperature: float | None = None,
     nvidia_max_tokens: int | None = None,
-    groq_api_key: str | None = None,
-    groq_model: str | None = None,
-    anthropic_api_key: str | None = None,
-    anthropic_model: str | None = None,
-    ollama_base_url: str | None = None,
-    ollama_model: str | None = None,
 ) -> list[AnalystProvider]:
-    """Build the provider chain in priority order: nvidia, groq, anthropic, ollama, stub.
-
-    Reads from env when a kwarg is None. The `preferred` provider, if reachable,
-    is moved to the front of the chain. ANALYST_PROVIDER env var is honoured.
+    """Build the provider chain in priority order: nvidia, stub.
     """
     nvidia_key = nvidia_api_key if nvidia_api_key is not None else os.getenv("NVIDIA_API_KEY", "").strip()
-    # Default model: Moonshot Kimi K2 Instruct. Verified live April 2026:
-    # - Strong base-rate reasoning (beats Nemotron 49B on 5-market synthetic
-    #   benchmark: 80% directional vs 40%, longer reasoning).
-    # - Fast (~2s/call) — required to fit 30 cycles into the daily run.
-    # - K2 Thinking variant works but generates 5+ minute responses on
-    #   single calls and is not viable for the per-cycle pipeline; users
-    #   who want CoT can override NVIDIA_MODEL=moonshotai/kimi-k2-thinking
-    #   with NVIDIA_TEMPERATURE=1.0 and NVIDIA_MAX_TOKENS=8192.
-    # DeepSeek R1 was EOL'd by NVIDIA NIM on 2026-01-26 (HTTP 410 Gone).
-    nvidia_model_name = nvidia_model or os.getenv(
-        "NVIDIA_MODEL", "moonshotai/kimi-k2-instruct"
-    )
+    nvidia_model_name = nvidia_model or os.getenv("NVIDIA_MODEL", "minimaxai/minimax-m2.7")
     try:
         nvidia_temp = float(nvidia_temperature if nvidia_temperature is not None else os.getenv("NVIDIA_TEMPERATURE", "0.6"))
     except (TypeError, ValueError):
@@ -910,12 +635,6 @@ def build_provider_chain(
         nvidia_max = int(nvidia_max_tokens if nvidia_max_tokens is not None else os.getenv("NVIDIA_MAX_TOKENS", "4096"))
     except (TypeError, ValueError):
         nvidia_max = 4096
-    groq_key = groq_api_key if groq_api_key is not None else os.getenv("GROQ_API_KEY", "").strip()
-    groq_model_name = groq_model or os.getenv("GROQ_MODEL", "llama3-70b-8192")
-    anthropic_key = anthropic_api_key if anthropic_api_key is not None else os.getenv("ANTHROPIC_API_KEY", "").strip()
-    anthropic_model_name = anthropic_model or os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
-    ollama_url = ollama_base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    ollama_model_name = ollama_model or os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 
     chain: list[AnalystProvider] = []
     if nvidia_key:
@@ -925,21 +644,15 @@ def build_provider_chain(
             temperature=nvidia_temp,
             max_tokens=nvidia_max,
         ))
-    if groq_key:
-        chain.append(GroqProvider(api_key=groq_key, model=groq_model_name))
-    if anthropic_key:
-        chain.append(AnthropicProvider(api_key=anthropic_key, model=anthropic_model_name))
-    # Ollama is always included as a local fallback; reachability is tested at call time
-    chain.append(OllamaProvider(base_url=ollama_url, model=ollama_model_name))
+
     chain.append(StubProvider())
 
-    preferred_normalized = (preferred or os.getenv("ANALYST_PROVIDER", "")).strip().lower()
-    if preferred_normalized:
-        for idx, provider in enumerate(chain):
-            if provider.name == preferred_normalized and idx > 0:
-                chain.insert(0, chain.pop(idx))
+    if preferred:
+        preferred = preferred.lower()
+        for i, p in enumerate(chain):
+            if p.name == preferred:
+                chain.insert(0, chain.pop(i))
                 break
-
     return chain
 
 
@@ -948,7 +661,7 @@ def build_provider_chain(
 # --------------------------------------------------------------------------- #
 
 
-class ClaudeAnalyst:
+class LLMAnalyst:
     """Provider-agnostic analyst (name kept for backward compatibility).
 
     A chain of providers is tried in priority order. Each provider failure logs

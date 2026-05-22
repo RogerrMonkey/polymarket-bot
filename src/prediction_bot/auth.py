@@ -68,7 +68,7 @@ def load_auth_settings() -> AuthSettings:
     private_key = _normalize_private_key(_required_env("POLYMARKET_PRIVATE_KEY"))
     funder_address = _normalize_funder_address(_required_env("POLYMARKET_FUNDER_ADDRESS"))
     # ANTHROPIC_API_KEY is optional here — Polymarket wallet auth does not need it.
-    # Analyst provider (groq/anthropic/ollama) is resolved independently in claude_analyst.py.
+    # Analyst provider (groq/anthropic/ollama) is resolved independently in llm_analyst.py.
     anthropic_api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
 
     signature_raw = os.getenv("SIGNATURE_TYPE", "1").strip()

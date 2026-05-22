@@ -45,7 +45,7 @@ class _FakeHttp:
 
 @dataclass
 class _FakeAnalysisResult:
-    """Stand-in for ClaudeAnalyst.AnalysisResult — same field shape."""
+    """Stand-in for LLMAnalyst.AnalysisResult — same field shape."""
     probability: float
     decision: str
     confidence: str

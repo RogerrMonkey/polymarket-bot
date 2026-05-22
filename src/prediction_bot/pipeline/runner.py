@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from prediction_bot.claude_analyst import ClaudeAnalyst
+from prediction_bot.llm_analyst import LLMAnalyst
 from prediction_bot.clients.http import HttpClient
 from prediction_bot.clients.polymarket import PolymarketClient
 from prediction_bot.config import AppConfig
@@ -238,24 +238,24 @@ def execute_scan_run(
         market_subset = [c.snapshot for c in candidates[:top_n_for_risk]]
         research_signals = research.analyze_markets(market_subset)
 
-    claude_analyst: ClaudeAnalyst | None = None
-    claude_news_items: list[NewsItem] = []
-    if config.claude.enabled:
-        claude_analyst = ClaudeAnalyst(
-            model=config.claude.model,
-            web_search_max=config.claude.web_search_max,
-            daily_budget_usd=config.claude.daily_budget_usd,
+    llm_analyst: LLMAnalyst | None = None
+    llm_news_items: list[NewsItem] = []
+    if config.llm.enabled:
+        llm_analyst = LLMAnalyst(
+            model=config.llm.model,
+            web_search_max=config.llm.web_search_max,
+            daily_budget_usd=config.llm.daily_budget_usd,
             log_path=root / "data" / "analyses.jsonl",
         )
         try:
-            claude_news_items = get_relevant_news(
+            llm_news_items = get_relevant_news(
                 http=http,
                 gdelt_query=config.research.gdelt_query,
                 min_relevance=config.research.news_min_relevance,
                 max_age_minutes=config.research.news_max_age_minutes,
             )
         except Exception as exc:  # noqa: BLE001
-            ingestion.errors.append(f"claude_news_error:{exc}")
+            ingestion.errors.append(f"llm_news_error:{exc}")
 
     calibrator = ProbabilityCalibrator(config.calibration)
 
@@ -282,10 +282,10 @@ def execute_scan_run(
             market_probability=market_prob,
         )
 
-        if claude_analyst is not None:
-            llm_result = claude_analyst.analyze(
+        if llm_analyst is not None:
+            llm_result = llm_analyst.analyze(
                 market=candidate.snapshot,
-                news_items=claude_news_items[:8],
+                news_items=llm_news_items[:8],
                 chainlink_price=None,
                 smart_money=getattr(candidate, "smart_money", None),
             )

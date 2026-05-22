@@ -559,7 +559,7 @@ def apply_smart_money_modifier(result: Any, signal: SmartMoneySignal | None) -> 
     """Mutate-and-return the analyst result with a smart-money adjustment.
 
     The result is expected to be an AnalysisResult (a frozen dataclass in
-    claude_analyst). Since it's immutable, we return a new instance.
+    llm_analyst). Since it's immutable, we return a new instance.
     Returns the original when there's nothing to do.
     """
     if signal is None or signal.consensus_strength == "Low" or signal.traders_present == 0:

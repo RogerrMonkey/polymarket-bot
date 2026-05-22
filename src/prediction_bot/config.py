@@ -86,11 +86,11 @@ class CalibrationSettings:
 
 
 @dataclass(frozen=True)
-class ClaudeSettings:
-    enabled: bool = _env_bool("BOT_CLAUDE_ENABLED", False)
-    model: str = os.getenv("BOT_CLAUDE_MODEL", "claude-sonnet-4-6")
-    web_search_max: int = _env_int("BOT_CLAUDE_WEB_SEARCH_MAX", 2)
-    daily_budget_usd: float = _env_float("BOT_CLAUDE_DAILY_BUDGET", 2.0)
+class LLMSettings:
+    enabled: bool = _env_bool("BOT_LLM_ENABLED", False)
+    model: str = os.getenv("BOT_NVIDIA_MODEL", "minimaxai/minimax-m2.7")
+    web_search_max: int = _env_int("BOT_LLM_WEB_SEARCH_MAX", 2)
+    daily_budget_usd: float = _env_float("BOT_LLM_DAILY_BUDGET", 2.0)
 
 
 @dataclass(frozen=True)
@@ -115,7 +115,7 @@ class AppConfig:
     runtime: RuntimeSettings = RuntimeSettings()
     research: ResearchSettings = ResearchSettings()
     calibration: CalibrationSettings = CalibrationSettings()
-    claude: ClaudeSettings = ClaudeSettings()
+    claude: LLMSettings = LLMSettings()
     storage: StorageSettings = StorageSettings()
     venue: VenueSettings = VenueSettings()
     compliance: ComplianceSettings = ComplianceSettings()

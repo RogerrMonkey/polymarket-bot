@@ -180,7 +180,7 @@ def run_loop_command(
     root = Path(".").resolve()
 
     if dry_run_schedule:
-        from prediction_bot.claude_analyst import build_provider_chain
+        from prediction_bot.llm_analyst import build_provider_chain
 
         chain = build_provider_chain()
         head = chain[0]

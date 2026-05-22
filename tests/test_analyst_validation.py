@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from prediction_bot.claude_analyst import AnalysisResult, _validate_and_normalise
+from prediction_bot.llm_analyst import AnalysisResult, _validate_and_normalise
 from prediction_bot.models import MarketSnapshot
 
 

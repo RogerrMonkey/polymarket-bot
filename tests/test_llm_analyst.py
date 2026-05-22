@@ -7,10 +7,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-import prediction_bot.claude_analyst as ca
-from prediction_bot.claude_analyst import (
+import prediction_bot.llm_analyst as ca
+from prediction_bot.llm_analyst import (
     AnthropicProvider,
-    ClaudeAnalyst,
+    LLMAnalyst,
     GroqProvider,
     OllamaProvider,
     ProviderResponse,
@@ -236,7 +236,7 @@ def test_build_prompt_sanitizes_external_data() -> None:
 def test_anthropic_provider_parses_tool_and_logs(monkeypatch, tmp_path: Path) -> None:
     _patch_imports(monkeypatch, anthropic_cls=_FakeAnthropic)
 
-    analyst = ClaudeAnalyst(
+    analyst = LLMAnalyst(
         api_key="test-key",
         model="claude-sonnet-4-6",
         daily_budget_usd=5.0,
@@ -266,7 +266,7 @@ def test_anthropic_provider_parses_tool_and_logs(monkeypatch, tmp_path: Path) ->
 
 
 def test_analyze_budget_guard(tmp_path: Path) -> None:
-    analyst = ClaudeAnalyst(
+    analyst = LLMAnalyst(
         api_key="test-key",
         model="claude-sonnet-4-6",
         daily_budget_usd=0.0,
@@ -289,7 +289,7 @@ def test_groq_provider_parses_tool_call(monkeypatch, tmp_path: Path) -> None:
     _patch_imports(monkeypatch, openai_cls=_FakeOpenAIClient)
 
     provider = GroqProvider(api_key="groq-test", model="llama3-70b-8192")
-    analyst = ClaudeAnalyst(
+    analyst = LLMAnalyst(
         providers=[provider],
         daily_budget_usd=5.0,
         log_path=tmp_path / "analyses.jsonl",
@@ -329,7 +329,7 @@ def test_ollama_provider_parses_json_response(monkeypatch, tmp_path: Path) -> No
 
     monkeypatch.setattr(OllamaProvider, "call", _fake_call)
 
-    analyst = ClaudeAnalyst(
+    analyst = LLMAnalyst(
         providers=[OllamaProvider(base_url="http://localhost:11434", model="qwen2.5:3b")],
         log_path=tmp_path / "analyses.jsonl",
     )
@@ -342,7 +342,7 @@ def test_ollama_provider_parses_json_response(monkeypatch, tmp_path: Path) -> No
 
 
 def test_stub_provider_returns_low_skip(tmp_path: Path) -> None:
-    analyst = ClaudeAnalyst(
+    analyst = LLMAnalyst(
         providers=[StubProvider()],
         log_path=tmp_path / "analyses.jsonl",
     )
@@ -394,7 +394,7 @@ def test_chain_falls_through_on_provider_failure(tmp_path: Path) -> None:
         def call(self, system_prompt: str, user_prompt: str) -> ProviderResponse:  # noqa: ARG002
             raise RuntimeError("boom")
 
-    analyst = ClaudeAnalyst(
+    analyst = LLMAnalyst(
         providers=[_BoomProvider(), StubProvider()],
         log_path=tmp_path / "analyses.jsonl",
     )
@@ -413,7 +413,7 @@ def test_chain_falls_through_on_missing_tool_input(tmp_path: Path) -> None:
         def call(self, system_prompt: str, user_prompt: str) -> ProviderResponse:  # noqa: ARG002
             return ProviderResponse(tool_input=None, input_tokens=10, output_tokens=5, cost_usd=0.0)
 
-    analyst = ClaudeAnalyst(
+    analyst = LLMAnalyst(
         providers=[_NoToolProvider(), StubProvider()],
         log_path=tmp_path / "analyses.jsonl",
     )
@@ -464,7 +464,7 @@ def test_analysis_result_has_reasoning_field(tmp_path: Path) -> None:
                 cost_usd=0.0,
             )
 
-    analyst = ClaudeAnalyst(providers=[_EchoProvider()], log_path=tmp_path / "a.jsonl")
+    analyst = LLMAnalyst(providers=[_EchoProvider()], log_path=tmp_path / "a.jsonl")
     result = analyst.analyze(market=_market(), news_items=[], chainlink_price=None)
     assert result.reasoning == "specific news catalyst outweighs base rate"
     assert len(result.reasoning) <= 200
@@ -476,7 +476,7 @@ def test_groq_mock_returns_reasoning_field(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GROQ_API_KEY", "test")
     monkeypatch.setenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-    analyst = ClaudeAnalyst(
+    analyst = LLMAnalyst(
         providers=[GroqProvider(api_key="test", model="llama-3.3-70b-versatile")],
         log_path=tmp_path / "a.jsonl",
     )
@@ -593,7 +593,7 @@ def test_build_prompt_reports_no_relevant_news_when_nothing_matches() -> None:
 # --------------------------------------------------------------------------- #
 
 
-from prediction_bot.claude_analyst import (  # noqa: E402
+from prediction_bot.llm_analyst import (  # noqa: E402
     NvidiaProvider,
     _looks_like_auth_error,
     _looks_like_rate_limit,
@@ -713,7 +713,7 @@ def test_nvidia_provider_rate_limit_raises_chain_falls_through(monkeypatch, tmp_
     _install_fake_openai_for_nvidia(monkeypatch, completions)
     provider = NvidiaProvider(api_key="nv", model="m")
 
-    # Direct call raises (chain handler in ClaudeAnalyst catches it).
+    # Direct call raises (chain handler in LLMAnalyst catches it).
     import pytest
 
     with pytest.raises(Exception, match="429"):
@@ -757,7 +757,7 @@ def test_chain_fallthrough_from_nvidia_auth_error_to_groq(monkeypatch, tmp_path:
                 input_tokens=10, output_tokens=5, cost_usd=0.0,
             )
 
-    analyst = ClaudeAnalyst(
+    analyst = LLMAnalyst(
         providers=[_NvidiaAuthFail(), _GroqOK(), StubProvider()],
         log_path=tmp_path / "analyses.jsonl",
     )
@@ -798,7 +798,7 @@ def test_build_provider_chain_no_nvidia_key_skips_nvidia(monkeypatch) -> None:
 # --------------------------------------------------------------------------- #
 
 
-from prediction_bot.claude_analyst import _extract_content  # noqa: E402
+from prediction_bot.llm_analyst import _extract_content  # noqa: E402
 
 
 class _MsgKimi:
